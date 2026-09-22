@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Build
+build/
+dist/
+*.spec
+*.exe
+*.dll
+
+# Runtime config
+config/settings.json
+config/settings.json.bak
+
+# Local AI / IDE
+.kilo/
+.kilocode/
+.vscode/
+.idea/
+.venv/
+venv/
+AGENTS.md
+
+# Temporary
+*.log
+*.tmp
+*.zip
+*.7z
+lookup_patch.diff
+
+# Windows
+Thumbs.db
+Desktop.ini

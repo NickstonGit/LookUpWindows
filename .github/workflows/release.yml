@@ -1,0 +1,60 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build and test dependencies
+        run: python -m pip install --quiet pytest pyinstaller
+
+      - name: Check tag matches APP_VERSION
+        shell: pwsh
+        run: |
+          $version = python -c "import sys; sys.path.insert(0, 'src'); import config; print(config.APP_VERSION)"
+          $expectedTag = "v$version"
+          if ("${{ github.ref_name }}" -ne $expectedTag) {
+            Write-Error "Tag ${{ github.ref_name }} does not match APP_VERSION $version (expected $expectedTag)."
+            exit 1
+          }
+
+      - name: Run tests
+        run: python -m pytest -q tests/
+
+      - name: Build portable EXE
+        shell: cmd
+        run: build-onefile.bat
+
+      - name: Create SHA-256 checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/LookUpWindows.exe").Hash.ToLowerInvariant()
+          "$hash  LookUpWindows.exe" | Set-Content -Encoding ascii "dist/LookUpWindows.exe.sha256.txt"
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            "dist/LookUpWindows.exe" `
+            "dist/LookUpWindows.exe.sha256.txt" `
+            --generate-notes `
+            --title "LookUpWindows ${{ github.ref_name }}"

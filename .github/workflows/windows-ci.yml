@@ -1,0 +1,39 @@
+name: windows-ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: python -m pip install --quiet pytest
+
+      - name: Byte-compile
+        run: python -m compileall -q src
+
+      - name: Import smoke test
+        run: python -c "import sys; sys.path.insert(0, 'src'); import config, winapi, dwm, winui, trayicon, icon, app"
+
+      - name: Run tests
+        run: python -m pytest -q tests/
