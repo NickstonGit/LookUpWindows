@@ -522,27 +522,31 @@ class DocumentedToolchainTests(unittest.TestCase):
 
 
 class SourceCompatibilityGateTests(unittest.TestCase):
-    """Broader Python versions are source/development compatibility only.
+    """Source compatibility is separate from the production CI contract.
 
-    Production is CPython 3.14 x64.  Running the sources on 3.10 is a
-    convenience for developers, never a licence to publish an artifact built by
-    another interpreter -- so the compatibility job must not build one.
+    The project may retain a broader source-level minimum for developer runs,
+    but Windows CI validates the supported production interpreter only:
+    CPython 3.14 x64.  This keeps CI and release evidence aligned.
     """
 
     def test_the_minimum_supported_version_is_ten(self):
         self.assertIn("SOURCE_PYTHON_MINIMUM = (3, 10)", BUILD_ENV_TOOL)
         self.assertTrue((ROOT / "README.md").exists())
 
-    def test_the_compatibility_matrix_includes_the_release_interpreter(self):
-        versions = re.findall(r'"(\d+\.\d+)"', job_section(CI, "test"))
-        self.assertIn("3.14", versions)
-        self.assertIn("3.10", versions)
+    def test_windows_ci_runs_only_the_release_interpreter(self):
+        section = job_section(CI, "test")
+        versions = re.findall(r'python-version:\s*"(\d+\.\d+)"', section)
+        self.assertEqual(versions, ["3.14"])
+        self.assertNotIn("matrix:", section)
+        self.assertIn('architecture: "x64"', section)
+        for stale in ("3.10", "3.11", "3.12", "3.13", "3.15"):
+            self.assertNotIn(f'python-version: "{stale}"', section)
 
-    def test_the_compatibility_matrix_never_builds_or_gates_a_release(self):
+    def test_the_test_job_never_builds_or_gates_a_release(self):
         section = job_section(CI, "test")
         self.assertNotIn("--mode release", section)
         for builder in ("build-onefile.bat", "build.bat", "PyInstaller", "arch.bat"):
-            self.assertNotIn(builder, section, f"the compatibility job runs {builder}")
+            self.assertNotIn(builder, section, f"the test job runs {builder}")
 
     def test_the_release_toolchain_is_314_x64_only(self):
         self.assertIn("RELEASE_PYTHON = (3, 14)", BUILD_ENV_TOOL)
