@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 
 try:
     import winreg
@@ -15,15 +18,144 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.json"
 
-APP_VERSION = "2026.09.22.10"
+logger = logging.getLogger("lookupwindows")
+
+APP_VERSION = "2026.10.05.1"
 APP_AUTHOR = "Nickston"
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUTOSTART_VALUE = "LookUpWindows"
 DEFAULT_CARD_WIDTH = 280
 MAX_PERSISTED_CARD_WIDTH = 16384
+
+# The reader's and the writer's shared size contract.  A writer that does not
+# check the serialised result can happily confirm a save whose very next load
+# rejects - which means the user loses the change *and* the previous state is
+# replaced by a backup of a file nobody can read.  One constant, both sides.
+MAX_CONFIG_BYTES = 1024 * 1024
+
+# Settings schema contract.
+#
+# A settings file is user-editable, so "valid JSON" is not enough to make a
+# candidate loadable: wrong container types used to crash startup (and could
+# then replace the last known-good backup with defaults on the next save), while
+# truthy string flags such as "false" silently flipped every boolean.  Every key
+# the application writes is therefore type-checked before a candidate is
+# accepted; unknown keys stay tolerated so older builds can read newer files.
+_BOOL_SETTING_KEYS = (
+    "alwaysOnTop",
+    "autostart",
+    "autoRefind",
+    "restoreMinimized",
+    "changeDetection",
+    "notifySound",
+    "notifyWindowReturn",
+    "hotkeysEnabled",
+    "firstRunSelector",
+)
+_FLOAT_SETTING_KEYS = ("opacity", "changeIntervalSec", "changeThreshold")
+_INT_SETTING_KEYS = ("ctrlX", "ctrlY")
+_BOOL_WINDOW_KEYS = ("collapsed", "clickThrough", "detectChanges", "pipEnabled")
+_STR_WINDOW_KEYS = ("process", "titleContains", "titleHint", "classHint")
+_INT_WINDOW_KEYS = ("width", "x", "y")
+_CROP_KEYS = ("mode", "x", "y", "width", "height")
+
+
+class ConfigSchemaError(ValueError):
+    """Raised when a settings document does not match the expected schema."""
+
+
+def _is_strict_bool(value) -> bool:
+    # bool("false") and bool("0") are both True, which used to turn explicitly
+    # disabled cards into enabled ones.  Only real JSON booleans count.
+    return isinstance(value, bool)
+
+
+def _is_strict_number(value) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def _is_strict_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def validate_crop_data(crop, where: str) -> None:
+    if not isinstance(crop, dict):
+        raise ConfigSchemaError(f"{where} must be an object")
+    for key in _CROP_KEYS:
+        if key not in crop:
+            continue
+        value = crop[key]
+        if key == "mode":
+            if not isinstance(value, str):
+                raise ConfigSchemaError(f"{where}.mode must be a string")
+        elif not _is_strict_number(value):
+            raise ConfigSchemaError(f"{where}.{key} must be a finite number")
+
+
+def validate_window_data(item, where: str) -> None:
+    if not isinstance(item, dict):
+        raise ConfigSchemaError(f"{where} must be an object")
+    for key in _STR_WINDOW_KEYS:
+        if key in item and not isinstance(item[key], str):
+            raise ConfigSchemaError(f"{where}.{key} must be a string")
+    for key in _INT_WINDOW_KEYS:
+        if key not in item or item[key] is None:
+            continue
+        if not _is_strict_int(item[key]):
+            raise ConfigSchemaError(f"{where}.{key} must be an integer or null")
+    for key in _BOOL_WINDOW_KEYS:
+        if key in item and not _is_strict_bool(item[key]):
+            raise ConfigSchemaError(f"{where}.{key} must be a boolean")
+    if item.get("crop") is not None:
+        validate_crop_data(item["crop"], f"{where}.crop")
+
+
+def validate_settings_data(data) -> None:
+    """Raise :class:`ConfigSchemaError` when ``data`` is not a usable settings document."""
+    if not isinstance(data, dict):
+        raise ConfigSchemaError("settings root must be a JSON object")
+    for key in _BOOL_SETTING_KEYS:
+        if key in data and not _is_strict_bool(data[key]):
+            raise ConfigSchemaError(f"{key} must be a boolean")
+    for key in _FLOAT_SETTING_KEYS:
+        if key in data and not _is_strict_number(data[key]):
+            raise ConfigSchemaError(f"{key} must be a finite number")
+    for key in _INT_SETTING_KEYS:
+        if key in data and data[key] is not None and not _is_strict_int(data[key]):
+            raise ConfigSchemaError(f"{key} must be an integer or null")
+    windows = data.get("windows")
+    if windows is not None:
+        if not isinstance(windows, list):
+            raise ConfigSchemaError("windows must be a list")
+        for index, item in enumerate(windows):
+            validate_window_data(item, f"windows[{index}]")
+    profiles = data.get("profiles")
+    if profiles is not None:
+        if not isinstance(profiles, dict):
+            raise ConfigSchemaError("profiles must be an object")
+        for name, items in profiles.items():
+            if not isinstance(name, str):
+                raise ConfigSchemaError("profile names must be strings")
+            if not isinstance(items, list):
+                raise ConfigSchemaError(f"profiles[{name!r}] must be a list")
+            for index, item in enumerate(items):
+                validate_window_data(item, f"profiles[{name!r}][{index}]")
+
+
+def settings_schema_problem(data) -> str | None:
+    """Return a human readable reason why ``data`` is unusable, or ``None``."""
+    try:
+        validate_settings_data(data)
+    except ConfigSchemaError as exc:
+        return str(exc)
+    return None
 
 
 def app_dir() -> Path:
@@ -55,7 +187,12 @@ def background_mode() -> bool:
 
 def default_settings_path() -> Path:
     explicit = _runtime_option("--config")
-    if explicit:
+    if explicit is not None:
+        # "--config" without a value is a user mistake, not a request for the
+        # default: silently ignoring it would start the app against the wrong
+        # settings file.
+        if not explicit.strip():
+            raise SystemExit("--config requires a path to a settings file")
         return Path(os.path.expandvars(explicit)).expanduser().resolve()
     if portable_mode() or not getattr(sys, "frozen", False):
         return app_dir() / "config" / "settings.json"
@@ -83,6 +220,13 @@ class CropRect:
         return self.mode == "relative"
 
     def is_valid(self) -> bool:
+        values = (self.x, self.y, self.width, self.height)
+        try:
+            finite = all(math.isfinite(float(value)) for value in values)
+        except (OverflowError, TypeError, ValueError):
+            return False
+        if not finite:
+            return False
         if self.width <= 0 or self.height <= 0:
             return False
         if self.is_relative():
@@ -95,7 +239,7 @@ class CropRect:
         return self.x >= 0 and self.y >= 0
 
     def resolved(self, source_width: int, source_height: int) -> "CropRect | None":
-        if source_width <= 0 or source_height <= 0:
+        if source_width <= 0 or source_height <= 0 or not self.is_valid():
             return None
         if self.is_relative():
             x = int(round(self.x * source_width))
@@ -106,6 +250,8 @@ class CropRect:
         return CropRect(x=int(round(self.x)), y=int(round(self.y)), width=int(round(self.width)), height=int(round(self.height)))
 
     def as_rect(self) -> tuple[int, int, int, int]:
+        if not self.is_valid():
+            raise ValueError("invalid crop rectangle")
         return (
             int(round(self.x)),
             int(round(self.y)),
@@ -125,6 +271,8 @@ class CropRect:
         return crop if crop.is_valid() else None
 
     def to_dict(self) -> dict:
+        if not self.is_valid():
+            raise ValueError("invalid crop rectangle")
         if self.is_relative():
             return {
                 "mode": "relative",
@@ -156,9 +304,14 @@ class CropRect:
                 height=float(data.get("height", 0)),
                 mode=mode,
             )
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             return None
         return crop if crop.is_valid() else None
+
+
+def _as_strict_bool(value, fallback: bool) -> bool:
+    """Return ``value`` only when it is a real JSON boolean, else ``fallback``."""
+    return value if isinstance(value, bool) else fallback
 
 
 @dataclass
@@ -172,6 +325,14 @@ class TrackedWindow:
     collapsed: bool = False
     click_through: bool = False
     detect_changes: bool = True
+    pip_enabled: bool = True
+    # Soft identity hints used only to disambiguate auto-refind.  They are not
+    # strict filters, because normal applications change their window titles.
+    title_hint: str = ""
+    class_hint: str = ""
+    # Runtime-only binding selected from the window selector.
+    # Not persisted: HWNDs are recreated after reboot.
+    source_hwnd: int | None = None
 
     def to_dict(self) -> dict:
         data = {
@@ -181,7 +342,12 @@ class TrackedWindow:
             "collapsed": bool(self.collapsed),
             "clickThrough": bool(self.click_through),
             "detectChanges": bool(self.detect_changes),
+            "pipEnabled": bool(self.pip_enabled),
         }
+        if self.title_hint:
+            data["titleHint"] = self.title_hint
+        if self.class_hint:
+            data["classHint"] = self.class_hint
         if self.crop and self.crop.is_valid():
             data["crop"] = self.crop.to_dict()
         if self.x is not None:
@@ -214,23 +380,40 @@ class TrackedWindow:
             x=x,
             y=y,
             width=width,
-            collapsed=bool(data.get("collapsed", False)),
-            click_through=bool(data.get("clickThrough", False)),
-            detect_changes=bool(data.get("detectChanges", True)),
+            collapsed=_as_strict_bool(data.get("collapsed"), False),
+            click_through=_as_strict_bool(data.get("clickThrough"), False),
+            detect_changes=_as_strict_bool(data.get("detectChanges"), True),
+            pip_enabled=_as_strict_bool(data.get("pipEnabled"), True),
+            title_hint=str(data.get("titleHint", "") or "").strip(),
+            class_hint=str(data.get("classHint", "") or "").strip(),
         )
 
     def clone(self) -> "TrackedWindow":
         cloned = TrackedWindow.from_dict(self.to_dict())
-        return cloned if cloned is not None else TrackedWindow(process=self.process, title_contains=self.title_contains)
+        if cloned is None:
+            return TrackedWindow(process=self.process, title_contains=self.title_contains)
+        # The live window binding is runtime state, so it survives cloning even
+        # though it is never written to the settings file.
+        cloned.source_hwnd = self.source_hwnd
+        return cloned
 
     def display_name(self) -> str:
         return self.title_contains or self.process or "Окно"
 
     def same_target(self, other: "TrackedWindow") -> bool:
-        return (
-            self.process.lower() == other.process.lower()
-            and self.title_contains.lower() == other.title_contains.lower()
-        )
+        if (
+            self.process.lower() != other.process.lower()
+            or self.title_contains.lower() != other.title_contains.lower()
+        ):
+            return False
+        # Identical process + title filters are only the same target when both
+        # entries point at the same window.  One process can expose several
+        # windows with an identical title (the same project opened twice), and
+        # each of them needs its own PiP card.  Entries without a live binding
+        # keep the conservative legacy dedup.
+        if not self.source_hwnd or not other.source_hwnd:
+            return True
+        return self.source_hwnd == other.source_hwnd
 
 
 @dataclass
@@ -253,9 +436,16 @@ class AppConfig:
     profiles: dict[str, list[TrackedWindow]] = field(default_factory=dict)
 
     def clamped(self) -> "AppConfig":
-        self.opacity = max(0.3, min(1.0, float(self.opacity)))
-        self.change_interval_sec = max(1.0, min(60.0, float(self.change_interval_sec)))
-        self.change_threshold = max(0.01, min(0.9, float(self.change_threshold)))
+        def finite(value, fallback: float) -> float:
+            try:
+                parsed = float(value)
+            except (OverflowError, TypeError, ValueError):
+                return fallback
+            return parsed if math.isfinite(parsed) else fallback
+
+        self.opacity = max(0.3, min(1.0, finite(self.opacity, 0.95)))
+        self.change_interval_sec = max(1.0, min(60.0, finite(self.change_interval_sec, 3.0)))
+        self.change_threshold = max(0.01, min(0.9, finite(self.change_threshold, 0.08)))
         return self
 
     def to_dict(self) -> dict:
@@ -288,18 +478,19 @@ class AppConfig:
             return cfg
 
         def as_bool(value, fallback: bool) -> bool:
-            return bool(value) if isinstance(value, bool) else fallback
+            return value if isinstance(value, bool) else fallback
 
         def as_float(value, fallback: float) -> float:
             try:
-                return float(value)
-            except (TypeError, ValueError):
+                parsed = float(value)
+            except (OverflowError, TypeError, ValueError):
                 return fallback
+            return parsed if math.isfinite(parsed) else fallback
 
         def as_int(value, fallback: int) -> int:
             try:
                 return int(value)
-            except (TypeError, ValueError):
+            except (OverflowError, TypeError, ValueError):
                 return fallback
 
         cfg.opacity = as_float(data.get("opacity"), cfg.opacity)
@@ -320,7 +511,15 @@ class AppConfig:
         cfg.first_run_selector = as_bool(data.get("firstRunSelector"), cfg.first_run_selector)
 
         cfg.windows = []
-        for item in data.get("windows") or []:
+        # A schema-valid document always has a list here, but from_dict() is also
+        # reachable from tests and legacy callers, so a wrong container type must
+        # degrade to defaults instead of raising TypeError during startup.
+        raw_windows = data.get("windows")
+        if isinstance(raw_windows, dict):
+            raw_windows = list(raw_windows.values())
+        elif not isinstance(raw_windows, (list, tuple)):
+            raw_windows = []
+        for item in raw_windows:
             tracked = TrackedWindow.from_dict(item)
             if tracked is not None:
                 cfg.windows.append(tracked)
@@ -346,50 +545,230 @@ class ConfigService:
     def __init__(self, path: Path | None = None):
         self.path = Path(path) if path else default_settings_path()
 
+    def backup_path(self) -> Path:
+        return self.path.with_suffix(self.path.suffix + ".bak")
+
+    def quarantined_path(self) -> Path:
+        return self.path.with_suffix(self.path.suffix + ".invalid")
+
+    @staticmethod
+    def _read_document(candidate: Path):
+        """Read and schema-check one candidate file.
+
+        Returns ``None`` when the file is missing, too large, syntactically
+        broken or schema-invalid.  A JSON-valid but schema-invalid document is
+        treated exactly like corruption: it must never become the live
+        configuration and must never become the backup.
+        """
+        try:
+            if candidate.stat().st_size > MAX_CONFIG_BYTES:
+                logger.warning(
+                    "Ignoring settings file %s: it is larger than %s bytes",
+                    candidate,
+                    MAX_CONFIG_BYTES,
+                )
+                return None
+            with open(candidate, "r", encoding="utf-8") as handle:
+                data = json.load(handle, parse_constant=ConfigService._reject_json_constant)
+        except (OSError, OverflowError, ValueError, json.JSONDecodeError, RecursionError):
+            return None
+        problem = settings_schema_problem(data)
+        if problem is not None:
+            logger.warning("Ignoring unusable settings file %s: %s", candidate, problem)
+            return None
+        return data
+
+    def _quarantine(self, candidate: Path) -> None:
+        """Move a schema-invalid primary aside so it cannot be reloaded later."""
+        try:
+            if not candidate.exists():
+                return
+            os.replace(candidate, self.quarantined_path())
+            logger.warning(
+                "Quarantined unusable settings file %s as %s",
+                candidate,
+                self.quarantined_path(),
+            )
+        except OSError:
+            logger.warning("Could not quarantine unusable settings file %s", candidate)
+
     def load(self) -> AppConfig:
-        candidates = [self.path, self.path.with_suffix(self.path.suffix + ".bak")]
+        candidates = [self.path, self.backup_path()]
         legacy = app_dir() / "config" / "settings.json"
-        if legacy not in candidates:
+        # An explicit destination is isolated from the source tree's local
+        # settings. Migration applies only to the default installed location.
+        if self.path == default_settings_path() and not _runtime_option("--config") and legacy not in candidates:
             candidates.append(legacy)
         for candidate in candidates:
-            try:
-                if candidate.stat().st_size > 1024 * 1024:
-                    continue
-                with open(candidate, "r", encoding="utf-8") as handle:
-                    config = AppConfig.from_dict(json.load(handle))
-                if candidate != self.path:
-                    self.save(config)
-                return config
-            except (OSError, ValueError, json.JSONDecodeError):
+            data = self._read_document(candidate)
+            if data is None:
+                if candidate == self.path:
+                    # Keep the last known-good backup intact, but do not leave a
+                    # broken primary in place to be re-read or re-backed-up.
+                    self._quarantine(candidate)
                 continue
+            config = AppConfig.from_dict(data)
+            if candidate != self.path:
+                self.save(config)
+            return config
         return AppConfig()
 
     def save(self, config: AppConfig) -> bool:
+        return self.save_dict(config.to_dict())
+
+    @staticmethod
+    def _reject_json_constant(value: str):
+        raise ValueError(f"non-finite JSON constant is not allowed: {value}")
+
+    def _replace_backup_atomically(self, source: Path) -> None:
+        """Replace the known-good backup without ever truncating it in place."""
+        backup = self.backup_path()
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=str(backup.parent), suffix=".bak.tmp")
+        try:
+            with source.open("rb") as src, os.fdopen(fd, "wb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+                dst.flush()
+                os.fsync(dst.fileno())
+            os.replace(tmp_name, backup)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+
+    def save_dict(self, data: dict) -> bool:
+        problem = settings_schema_problem(data)
+        if problem is not None:
+            logger.warning("Refusing to persist invalid settings payload: %s", problem)
+            return False
+        # Serialise first and measure the result.  A schema-valid snapshot can
+        # still exceed what the reader accepts (many profiles, long filter
+        # strings), and writing it anyway turns a confirmed save into a file the
+        # next start quarantines - taking the change *and* the previous state
+        # with it.  The bytes are handed to the temp file unchanged, so what is
+        # measured is exactly what lands on disk.
+        try:
+            encoded = json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            logger.warning("Refusing to persist settings that cannot be encoded: %s", exc)
+            return False
+        if len(encoded) > MAX_CONFIG_BYTES:
+            logger.error(
+                "Refusing to persist settings: the serialised document is %s bytes, "
+                "more than the %s bytes a settings file may contain; the previous "
+                "settings were kept",
+                len(encoded),
+                MAX_CONFIG_BYTES,
+            )
+            return False
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp_name = tempfile.mkstemp(dir=str(self.path.parent), suffix=".tmp")
             try:
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    json.dump(config.to_dict(), handle, ensure_ascii=False, indent=2)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(encoded)
                     handle.flush()
                     os.fsync(handle.fileno())
-                if self.path.exists():
-                    try:
-                        with open(self.path, "r", encoding="utf-8") as current:
-                            json.load(current)
-                        shutil.copy2(self.path, self.path.with_suffix(self.path.suffix + ".bak"))
-                    except (OSError, ValueError, json.JSONDecodeError):
-                        pass
+                if self.path.exists() and self._read_document(self.path) is not None:
+                    # Only a schema-valid primary may become the backup; an
+                    # invalid one would destroy the last known-good copy.
+                    self._replace_backup_atomically(self.path)
                 os.replace(tmp_name, self.path)
-            except OSError:
+            except (OSError, ValueError):
                 try:
                     os.unlink(tmp_name)
                 except OSError:
                     pass
                 raise
             return True
-        except OSError:
+        except (OSError, ValueError):
             return False
+
+
+class AsyncConfigSaver:
+    """Single-writer, coalescing config persistence worker.
+
+    The UI thread only creates an immutable dict snapshot.  File reads, JSON
+    encoding, fsync, backup copy and atomic replace all run on this worker, so a
+    slow/filtered/network-backed settings path cannot stall native UI dispatch.
+    """
+
+    def __init__(self, service: ConfigService, on_result=None):
+        self._service = service
+        self._on_result = on_result
+        self._condition = threading.Condition()
+        self._pending: dict | None = None
+        self._saving = False
+        self._closed = False
+        self._last_result = True
+        self._worker = threading.Thread(
+            target=self._run,
+            name="LookUpWindows-ConfigSaver",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def submit(self, config: AppConfig) -> bool:
+        snapshot = config.to_dict()
+        with self._condition:
+            if self._closed:
+                return False
+            # Latest state wins.  This intentionally coalesces drag/resize bursts.
+            self._pending = snapshot
+            self._condition.notify()
+        return True
+
+    def flush(self, timeout: float | None = None) -> bool:
+        with self._condition:
+            done = self._condition.wait_for(
+                lambda: self._pending is None and not self._saving,
+                timeout=None if timeout is None else max(0.0, float(timeout)),
+            )
+            return bool(done and self._last_result)
+
+    def close(self, timeout: float = 2.0) -> bool:
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+        if self._worker is not threading.current_thread():
+            self._worker.join(timeout=max(0.0, float(timeout)))
+        return not self._worker.is_alive()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                self._condition.wait_for(lambda: self._closed or self._pending is not None)
+                if self._pending is None and self._closed:
+                    return
+                data = self._pending
+                self._pending = None
+                self._saving = True
+
+            try:
+                ok = self._service.save_dict(data or {})
+            except Exception:
+                logger.exception("Unexpected settings persistence failure")
+                ok = False
+
+            with self._condition:
+                self._saving = False
+                self._last_result = ok
+                self._condition.notify_all()
+
+            callback = self._on_result
+            if callback is not None:
+                try:
+                    callback(ok)
+                except Exception:
+                    # Persistence must never die because a UI notification hook
+                    # disappeared during shutdown.
+                    pass
 
 
 class Autostart:
@@ -399,7 +778,8 @@ class Autostart:
             args.append("--portable")
         explicit = _runtime_option("--config")
         if explicit:
-            args.extend(["--config", explicit])
+            resolved = Path(os.path.expandvars(explicit)).expanduser().resolve()
+            args.extend(["--config", str(resolved)])
         return args
 
     def run_command(self) -> str:
@@ -408,7 +788,7 @@ class Autostart:
             stable = current.with_name("LookUpWindows.exe")
             executable = stable if stable.exists() else current
             return subprocess.list2cmdline([str(executable), *self._runtime_args()])
-        script = PROJECT_ROOT / "app.py"
+        script = PROJECT_ROOT / "src" / "app.py"
         exe = Path(sys.executable)
         pythonw = exe.parent / "pythonw.exe"
         runner = pythonw if pythonw.exists() else exe

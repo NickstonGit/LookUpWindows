@@ -65,6 +65,28 @@ class UiContractTests(unittest.TestCase):
         self.assertIn("owner=0", init)
         self.assertNotIn("owner=app.panel.hwnd", init)
 
+    def test_control_panel_lists_configured_windows_and_toggles_pip(self):
+        paint = self._method_source("ControlWnd", "_paint")
+        down = self._method_source("ControlWnd", "_on_down")
+        self.assertIn("self.app.config.windows", paint)
+        self.assertIn("tracked.pip_enabled", paint)
+        self.assertIn("toggle_tracked_pip", down)
+
+    def test_rebuild_creates_runtime_cards_only_for_enabled_pips(self):
+        body = self._method_source("App", "rebuild_cards")
+        self.assertIn("if tracked.pip_enabled", body)
+        self.assertIn("_create_card_for_tracked", body)
+
+    def test_card_close_disables_pip_instead_of_deleting_configuration(self):
+        body = self._method_source("CardWnd", "_on_left_up")
+        self.assertIn("self.app.disable_card", body)
+        self.assertNotIn("self.app.remove_card", body)
+
+    def test_remove_is_still_explicitly_available(self):
+        body = self._method_source("App", "tracked_window_menu")
+        self.assertIn("Удалить из списка", body)
+        self.assertIn("remove_tracked_window", body)
+
 
 if __name__ == "__main__":
     unittest.main()

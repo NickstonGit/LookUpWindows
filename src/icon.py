@@ -5,7 +5,7 @@ import struct
 from ctypes import wintypes
 from pathlib import Path
 
-from winui import gdi32, kernel32, rgb, user32
+from winui import brush, gdi32, rgb, user32
 
 DIB_RGB_COLORS = 0
 BI_RGB = 0
@@ -60,8 +60,7 @@ user32.DestroyIcon.argtypes = [ctypes.c_void_p]
 user32.DestroyIcon.restype = wintypes.BOOL
 
 
-def _draw(size: int) -> bytes:
-    dc = gdi32.CreateCompatibleDC(None)
+def _new_bitmap_header(size: int) -> BITMAPINFOHEADER:
     header = BITMAPINFOHEADER()
     header.biSize = ctypes.sizeof(BITMAPINFOHEADER)
     header.biWidth = size
@@ -69,79 +68,83 @@ def _draw(size: int) -> bytes:
     header.biPlanes = 1
     header.biBitCount = 32
     header.biCompression = BI_RGB
+    return header
+
+
+def _render_bitmap(size: int) -> tuple[int, int]:
+    """Render the icon once and return ``(HBITMAP, bits_address)``.
+
+    The selected object is always restored before the memory DC is deleted.  The
+    caller owns the returned HBITMAP and may keep it long enough for
+    CreateIconIndirect or copy its pixels for ICO serialization.
+    """
+    dc = gdi32.CreateCompatibleDC(None)
+    if not dc:
+        raise OSError("icon DC creation failed")
     bits = ctypes.c_void_p()
-    bitmap = gdi32.CreateDIBSection(dc, ctypes.byref(header), DIB_RGB_COLORS, ctypes.byref(bits), None, 0)
+    bitmap = gdi32.CreateDIBSection(
+        dc,
+        ctypes.byref(_new_bitmap_header(size)),
+        DIB_RGB_COLORS,
+        ctypes.byref(bits),
+        None,
+        0,
+    )
     if not bitmap or not bits.value:
         if bitmap:
             gdi32.DeleteObject(bitmap)
         gdi32.DeleteDC(dc)
         raise OSError("CreateDIBSection failed")
-    raw = b""
+
+    old = gdi32.SelectObject(dc, bitmap)
+    if not old:
+        gdi32.DeleteObject(bitmap)
+        gdi32.DeleteDC(dc)
+        raise OSError("SelectObject(icon bitmap) failed")
+
     try:
-        old = gdi32.SelectObject(dc, bitmap)
         margin = max(1, size // 10)
         border = max(1, size // 16)
-        user32.FillRect(dc, ctypes.byref(wintypes.RECT(0, 0, size, size)), _brush(ICON_BG))
-        user32.FrameRect(dc, ctypes.byref(wintypes.RECT(margin, margin, size - margin, size - margin)), _brush(ACCENT))
+        user32.FillRect(dc, ctypes.byref(wintypes.RECT(0, 0, size, size)), brush(ICON_BG))
+        user32.FrameRect(
+            dc,
+            ctypes.byref(wintypes.RECT(margin, margin, size - margin, size - margin)),
+            brush(ACCENT),
+        )
         inner = margin + border * 2
         gap = max(1, size // 24)
         bar_h = max(1, (size - 2 * inner - 2 * gap) // 3)
-        colors = (ACCENT, ACCENT_LIGHT, ACCENT_GRAY)
         y = inner
-        for color in colors:
-            user32.FillRect(dc, ctypes.byref(wintypes.RECT(inner, y, size - inner, y + bar_h)), _brush(color))
+        for color in (ACCENT, ACCENT_LIGHT, ACCENT_GRAY):
+            user32.FillRect(
+                dc,
+                ctypes.byref(wintypes.RECT(inner, y, size - inner, y + bar_h)),
+                brush(color),
+            )
             y += bar_h + gap
+
+        # Classic GDI leaves the alpha channel at zero.  Set it in one strided
+        # slice rather than 65k Python loop iterations for a 256px icon.
+        raw = bytearray(ctypes.string_at(bits.value, size * size * 4))
+        raw[3::4] = b"\xff" * (size * size)
+        ctypes.memmove(bits.value, bytes(raw), len(raw))
+    except Exception:
         gdi32.SelectObject(dc, old)
-        raw_bytes = bytearray(ctypes.string_at(bits.value, size * size * 4))
-        # Classic GDI drawing does not populate the alpha channel of a 32-bit DIB.
-        # Windows 10/11 and modern icon readers do honour that channel, so an
-        # all-zero alpha makes an otherwise valid icon fully transparent.
-        for offset in range(3, len(raw_bytes), 4):
-            raw_bytes[offset] = 255
-        raw = bytes(raw_bytes)
-    finally:
         gdi32.DeleteObject(bitmap)
         gdi32.DeleteDC(dc)
-    return bytes(raw)
+        raise
+    else:
+        gdi32.SelectObject(dc, old)
+        gdi32.DeleteDC(dc)
+        return (int(bitmap), int(bits.value))
 
 
-_brush_cache: dict[int, int] = {}
-
-
-def _brush(color: int) -> int:
-    cached = _brush_cache.get(color)
-    if cached is not None:
-        return cached
-    handle = int(gdi32.CreateSolidBrush(color) or 0)
-    if handle:
-        _brush_cache[color] = handle
-    return handle
-
-
-def _downscale(src: bytes, src_size: int, dst_size: int) -> bytes:
-    factor = src_size // dst_size
-    out = bytearray(dst_size * dst_size * 4)
-    for y in range(dst_size):
-        for x in range(dst_size):
-            r_total = g_total = b_total = a_total = 0
-            for dy in range(factor):
-                for dx in range(factor):
-                    off = ((y * factor + dy) * src_size + (x * factor + dx)) * 4
-                    b_total += src[off]
-                    g_total += src[off + 1]
-                    r_total += src[off + 2]
-                    a_total += src[off + 3]
-            count = factor * factor
-            off = (y * dst_size + x) * 4
-            out[off] = b_total // count
-            out[off + 1] = g_total // count
-            out[off + 2] = r_total // count
-            out[off + 3] = a_total // count
-    return bytes(out)
-
-
-def draw_icon_pixels(size: int) -> bytes:
-    return _draw(size)
+def _draw(size: int) -> bytes:
+    bitmap, bits_address = _render_bitmap(size)
+    try:
+        return ctypes.string_at(bits_address, size * size * 4)
+    finally:
+        gdi32.DeleteObject(bitmap)
 
 
 def make_ico_file() -> bytes:
@@ -150,16 +153,16 @@ def make_ico_file() -> bytes:
 
 def _compose_ico(images: dict[int, bytes]) -> bytes:
     sizes = sorted(images)
-    out = bytearray()
-    out += struct.pack("<HHH", 0, 1, len(sizes))
+    payloads = {size: _ico_image(size, images[size]) for size in sizes}
+    out = bytearray(struct.pack("<HHH", 0, 1, len(sizes)))
     offset = 6 + 16 * len(sizes)
     for size in sizes:
-        data = _ico_image(size, images[size])
+        data = payloads[size]
         dir_size = 0 if size >= 256 else size
         out += struct.pack("<BBBBHHII", dir_size, dir_size, 0, 0, 1, 32, len(data), offset)
         offset += len(data)
     for size in sizes:
-        out += _ico_image(size, images[size])
+        out += payloads[size]
     return bytes(out)
 
 
@@ -190,24 +193,24 @@ def ensure_ico_file(path: Path) -> bool:
 
 def make_tray_icon() -> int:
     size = 32
-    header = BITMAPINFOHEADER()
-    header.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-    header.biWidth = size
-    header.biHeight = -size
-    header.biPlanes = 1
-    header.biBitCount = 32
-    header.biCompression = BI_RGB
-    bits = ctypes.c_void_p()
-    dc = gdi32.CreateCompatibleDC(None)
-    color_bitmap = gdi32.CreateDIBSection(dc, ctypes.byref(header), DIB_RGB_COLORS, ctypes.byref(bits), None, 0)
-    if not color_bitmap or not bits.value:
-        raise OSError("icon bitmap creation failed")
+    color_bitmap = 0
+    mask = 0
     try:
-        pixels = _draw(size)
-        ctypes.memmove(bits.value, pixels, len(pixels))
+        # Reuse the same rendered DIB as the ICO path instead of drawing once
+        # into a throwaway bitmap and copying into a second DIB.
+        color_bitmap, _bits = _render_bitmap(size)
         mask_stride = ((size + 31) // 32) * 4
         mask_bits = ctypes.create_string_buffer(mask_stride * size)
-        mask = gdi32.CreateBitmap(size, size, 1, 1, ctypes.cast(mask_bits, ctypes.c_void_p))
+        mask = int(
+            gdi32.CreateBitmap(
+                size,
+                size,
+                1,
+                1,
+                ctypes.cast(mask_bits, ctypes.c_void_p),
+            )
+            or 0
+        )
         if not mask:
             raise OSError("icon mask creation failed")
         info = ICONINFO()
@@ -215,13 +218,14 @@ def make_tray_icon() -> int:
         info.hbmMask = mask
         info.hbmColor = color_bitmap
         hicon = user32.CreateIconIndirect(ctypes.byref(info))
-        gdi32.DeleteObject(mask)
         if not hicon:
             raise OSError("CreateIconIndirect failed")
         return int(hicon)
     finally:
-        gdi32.DeleteObject(color_bitmap)
-        gdi32.DeleteDC(dc)
+        if mask:
+            gdi32.DeleteObject(mask)
+        if color_bitmap:
+            gdi32.DeleteObject(color_bitmap)
 
 
 def destroy_tray_icon(hicon: int) -> None:

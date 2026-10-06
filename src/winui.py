@@ -44,6 +44,7 @@ HWND_NOTOPMOST = ctypes.c_void_p(-2)
 
 LWA_ALPHA = 0x0002
 
+WM_NULL = 0x0000
 WM_DESTROY = 0x0002
 WM_CLOSE = 0x0010
 WM_PAINT = 0x000F
@@ -195,10 +196,17 @@ user32.TrackPopupMenu.argtypes = [HMENU, wintypes.UINT, ctypes.c_int, ctypes.c_i
 user32.TrackPopupMenu.restype = ctypes.c_int
 user32.DestroyMenu.argtypes = [HMENU]
 user32.DestroyMenu.restype = wintypes.BOOL
-user32.GetWindowLongPtrW.argtypes = [HWND, ctypes.c_int]
-user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
-user32.SetWindowLongPtrW.argtypes = [HWND, ctypes.c_int, ctypes.c_ssize_t]
-user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+if ctypes.sizeof(ctypes.c_void_p) == 8:
+    _get_window_long_ptr = user32.GetWindowLongPtrW
+    _set_window_long_ptr = user32.SetWindowLongPtrW
+else:
+    # Get/SetWindowLongPtr are C macros that map to Get/SetWindowLong on 32-bit Windows.
+    _get_window_long_ptr = user32.GetWindowLongW
+    _set_window_long_ptr = user32.SetWindowLongW
+_get_window_long_ptr.argtypes = [HWND, ctypes.c_int]
+_get_window_long_ptr.restype = ctypes.c_ssize_t
+_set_window_long_ptr.argtypes = [HWND, ctypes.c_int, ctypes.c_ssize_t]
+_set_window_long_ptr.restype = ctypes.c_ssize_t
 user32.RegisterHotKey.argtypes = [HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
 user32.RegisterHotKey.restype = wintypes.BOOL
 user32.UnregisterHotKey.argtypes = [HWND, ctypes.c_int]
@@ -287,10 +295,12 @@ user32.RegisterWindowMessageW.restype = wintypes.UINT
 
 ERROR_ALREADY_EXISTS = 183
 WAKE_MESSAGE_NAME = "LookUpWindows-Wake"
+QUIT_MESSAGE_NAME = "LookUpWindows-Quit"
 
 
 _single_instance_mutex: int = 0
 _wake_message_id: int = 0
+_quit_message_id: int = 0
 
 
 def register_wake_message() -> int:
@@ -298,6 +308,31 @@ def register_wake_message() -> int:
     if not _wake_message_id:
         _wake_message_id = int(user32.RegisterWindowMessageW(WAKE_MESSAGE_NAME) or 0)
     return _wake_message_id
+
+
+def register_quit_message() -> int:
+    global _quit_message_id
+    if not _quit_message_id:
+        _quit_message_id = int(user32.RegisterWindowMessageW(QUIT_MESSAGE_NAME) or 0)
+    return _quit_message_id
+
+
+def request_graceful_quit(timeout_ms: int = 1500) -> bool:
+    """Ask a running instance to shut down through its normal restore path.
+
+    Force-killing a running LookUp can leave a parked foreign window off-screen,
+    so tooling (build scripts, smoke tests, installers) must use this protocol
+    instead.  Returns False when no instance answered in time.
+    """
+    quit_message = register_quit_message()
+    hwnd = user32.FindWindowW("WPCtrl", None)
+    if not hwnd or not quit_message:
+        return False
+    result = ctypes.c_size_t(0)
+    sent = user32.SendMessageTimeoutW(
+        hwnd, quit_message, 0, 0, SMTO_ABORTIFHUNG, max(100, int(timeout_ms)), ctypes.byref(result)
+    )
+    return bool(sent) and bool(result.value)
 
 
 def acquire_single_instance(name: str) -> bool:
@@ -557,10 +592,10 @@ def set_alpha(hwnd: int, alpha: float) -> None:
 
 
 def set_click_through(hwnd: int, enabled: bool) -> None:
-    style = int(user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE))
+    style = int(_get_window_long_ptr(hwnd, GWL_EXSTYLE))
     desired = style | WS_EX_TRANSPARENT if enabled else style & ~WS_EX_TRANSPARENT
     if desired != style:
-        user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, desired)
+        _set_window_long_ptr(hwnd, GWL_EXSTYLE, desired)
         user32.SetWindowPos(
             hwnd, None, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
@@ -615,6 +650,7 @@ def track_popup_menu(items, hwnd: int) -> int:
     menu = user32.CreatePopupMenu()
     if not menu:
         return 0
+    command = 0
     try:
         for entry in items or []:
             if entry is None:
@@ -625,9 +661,12 @@ def track_popup_menu(items, hwnd: int) -> int:
                 user32.AppendMenuW(menu, flags, item_id, text)
         point_x, point_y = get_cursor_pos()
         user32.SetForegroundWindow(hwnd)
-        command = user32.TrackPopupMenu(
-            menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, point_x, point_y, 0, hwnd, None
-        )
+        try:
+            command = user32.TrackPopupMenu(
+                menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, point_x, point_y, 0, hwnd, None
+            )
+        finally:
+            user32.PostMessageW(hwnd, WM_NULL, 0, 0)
     finally:
         user32.DestroyMenu(menu)
     return int(command)
@@ -639,16 +678,24 @@ def xy_from_lparam(lparam) -> tuple[int, int]:
 
 def enable_dpi_awareness() -> None:
     try:
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
-        return
-    except Exception:
+        setter = ctypes.windll.user32.SetProcessDpiAwarenessContext
+        setter.argtypes = [ctypes.c_void_p]
+        setter.restype = wintypes.BOOL
+        if setter(ctypes.c_void_p(-4)):
+            return
+    except (AttributeError, OSError, ValueError):
         pass
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        return
-    except Exception:
+        setter = ctypes.windll.shcore.SetProcessDpiAwareness
+        setter.argtypes = [ctypes.c_int]
+        setter.restype = ctypes.c_long
+        if setter(2) == 0:  # S_OK; PROCESS_PER_MONITOR_DPI_AWARE
+            return
+    except (AttributeError, OSError, ValueError):
         pass
     try:
-        ctypes.windll.user32.SetProcessDpiAware()
-    except Exception:
+        legacy = ctypes.windll.user32.SetProcessDPIAware
+        legacy.restype = wintypes.BOOL
+        legacy()
+    except (AttributeError, OSError, ValueError):
         pass

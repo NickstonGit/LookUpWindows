@@ -11,7 +11,9 @@ permissions:
 jobs:
   build-release:
     runs-on: windows-latest
-    timeout-minutes: 20
+    # The onefile artifact must pass every recovery scenario and wait for real
+    # restores, so the job needs considerably more than the build itself.
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -20,10 +22,19 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          # Production/release interpreter.  The Tcl/Tk data of Python 3.14 ships
+          # as archives mounted through zipfs, which is what the released
+          # artifact has to be built and smoke-tested with.
+          python-version: "3.14"
 
-      - name: Install build and test dependencies
-        run: python -m pip install --quiet pytest pyinstaller
+      - name: Install pinned build and test dependencies
+        run: python -m pip install --quiet pytest ruff==0.16.1 -r requirements-build.txt
+
+      - name: Initialize observed release gate evidence
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force "build/release-gates" -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path "build/release-gates" | Out-Null
 
       - name: Check tag matches APP_VERSION
         shell: pwsh
@@ -35,26 +46,115 @@ jobs:
             exit 1
           }
 
-      - name: Run tests
-        run: python -m pytest -q tests/
+      - name: Release build environment
+        shell: pwsh
+        run: |
+          python tools/check_build_env.py --mode release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType File -Force "build/release-gates/check_build_env_release.ok" | Out-Null
 
-      - name: Build portable EXE
+      - name: Lint
+        shell: pwsh
+        run: |
+          python -m ruff check src tools tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType File -Force "build/release-gates/ruff.ok" | Out-Null
+
+      - name: Byte-compile and run tests
+        shell: pwsh
+        run: |
+          python -m compileall -q src
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pytest -q tests/
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType File -Force "build/release-gates/pytest.ok" | Out-Null
+
+      - name: Source import closure
+        shell: pwsh
+        run: |
+          python tools/check_source_imports.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType File -Force "build/release-gates/check_source_imports.ok" | Out-Null
+
+      - name: Build production onefile EXE
         shell: cmd
         run: build-onefile.bat
 
-      - name: Create SHA-256 checksum
+      - name: Confirm the artifact carries the Python 3.14 runtime
         shell: pwsh
         run: |
-          $hash = (Get-FileHash -Algorithm SHA256 "dist/LookUpWindows.exe").Hash.ToLowerInvariant()
-          "$hash  LookUpWindows.exe" | Set-Content -Encoding ascii "dist/LookUpWindows.exe.sha256.txt"
+          # The release contract is Python 3.14 x64.  A successful build script is
+          # not proof: the frozen archive has to actually carry the 3.14
+          # interpreter, otherwise a stray interpreter on the runner produced the
+          # published EXE.
+          python tools/verify_frozen_runtime.py --exe "dist/LookUpWindows.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType File -Force "build/release-gates/verify_frozen_runtime.ok" | Out-Null
+
+      - name: Frozen artifact recovery and lifetime gates
+        shell: pwsh
+        run: |
+          # A successful PyInstaller exit proves nothing about the artifact: it
+          # has to reach UI readiness, execute every recovery obligation it takes
+          # on and refuse unbound helper processes.  Every scenario of the tool's
+          # own registry runs, so adding a scenario to SCENARIOS *is* adding a
+          # release gate; one that cannot prove its invariant fails the release.
+          python tools/runtime_smoke.py --mode exe --exe "dist/LookUpWindows.exe" --all
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType File -Force "build/release-gates/runtime_smoke_all.ok" | Out-Null
+
+      - name: Build and verify source archive
+        shell: cmd
+        run: arch.bat
+
+      - name: Verify source archive
+        shell: pwsh
+        run: |
+          $archive = Get-Item "LookUpWindows-src.zip" -ErrorAction SilentlyContinue
+          if (-not $archive) { throw "Source archive was not created" }
+          & .\tools\verify_source_archive.ps1 -ArchivePath $archive.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType File -Force "build/release-gates/verify_source_archive.ok" | Out-Null
+
+      - name: Record the gates that ran against these bytes
+        shell: pwsh
+        run: |
+          # The manifest may only be written once every gate above has really
+          # passed for the files on disk right now, so the recording is explicit
+          # and is refused if a gate is missing or did not pass.
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          $gates = @{}
+          Get-ChildItem -LiteralPath "build/release-gates" -Filter "*.ok" -File | ForEach-Object {
+            $gates[$_.BaseName] = $true
+          }
+          $gates | ConvertTo-Json | Set-Content -Encoding utf8 "build/release-gates.json"
+          python tools/release_manifest.py --record-gates --gates build/release-gates.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Write and verify the release manifest
+        shell: pwsh
+        run: |
+          # The manifest binds the SHA-256 of the published bytes to this revision
+          # and to the gates that passed for them; the verification afterwards
+          # recomputes every hash, so a mismatching pair cannot be published.
+          python tools/release_manifest.py --write --gates build/release-gates.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/release_manifest.py --verify
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Create GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          python tools/release_manifest.py --verify
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $source = Get-Item "LookUpWindows-src.zip"
           gh release create "${{ github.ref_name }}" `
             "dist/LookUpWindows.exe" `
             "dist/LookUpWindows.exe.sha256.txt" `
+            "LookUpWindows-src.zip.sha256.txt" `
+            "release-manifest.json" `
+            "$($source.FullName)" `
             --generate-notes `
             --title "LookUpWindows ${{ github.ref_name }}"

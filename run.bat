@@ -2,11 +2,8 @@
 setlocal
 cd /d "%~dp0"
 
-if exist "dist\LookUpWindows\LookUpWindows.exe" (
-    start "" "dist\LookUpWindows\LookUpWindows.exe"
-    echo Started: dist\LookUpWindows\LookUpWindows.exe
-    exit /b 0
-)
+rem The project has exactly one build: the onefile EXE. There is no onedir
+rem variant, so the only artifact this script can start is dist\LookUpWindows.exe.
 
 if exist "dist\LookUpWindows.exe" (
     start "" "dist\LookUpWindows.exe"
@@ -21,7 +18,7 @@ for /f "delims=" %%F in ('dir /b /o-d "dist\LookUpWindows-*.exe" 2^>nul') do (
 
 if not defined EXE (
     echo Executable not found in dist\.
-    echo Run build.bat first.
+    echo Run build-onefile.bat first.
     exit /b 1
 )
 

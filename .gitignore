@@ -13,18 +13,18 @@ dist/
 *.exe
 *.dll
 
-# Runtime config
+# Runtime config and recovery state
+# settings.json itself plus every sibling it can produce at runtime
+# (.bak, .invalid, .park.json, .park.json.lock, .park.json.invalid.*).
+# config/settings.example.json is deliberately NOT matched by this rule.
 config/settings.json
-config/settings.json.bak
+config/settings.json.*
 
-# Local AI / IDE
-.kilo/
-.kilocode/
+# Local IDE / virtualenv
 .vscode/
 .idea/
 .venv/
 venv/
-AGENTS.md
 
 # Temporary
 *.log
@@ -32,7 +32,19 @@ AGENTS.md
 *.zip
 *.7z
 lookup_patch.diff
+out.txt
+
+# Agent tooling that is not part of the product
+.clinerules
+.kilocode/
 
 # Windows
 Thumbs.db
 Desktop.ini
+
+# Local tool caches
+.ruff_cache/
+
+# Generated release attestations
+release-manifest.json
+*.sha256.txt

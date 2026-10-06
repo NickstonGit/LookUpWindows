@@ -12,14 +12,15 @@ class RuntimeArchitectureTests(unittest.TestCase):
             node for node in ast.walk(tree)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "start"
         )
-        calls = [
-            node for node in ast.walk(start)
-            if isinstance(node, ast.Call)
-        ]
-        self.assertFalse(any(
-            isinstance(call.func, ast.Attribute) and call.func.attr == "show_panel"
-            for call in calls
-        ))
+        # Panel visibility is allowed only as a fallback when tray registration
+        # failed, so a background launch never becomes inaccessible.
+        fallback = next(node for node in start.body if isinstance(node, ast.If)
+                        and ast.unparse(node.test) == "self.tray is None")
+        self.assertTrue(any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                            and node.func.attr == "show_panel" for node in ast.walk(fallback.body[0])))
+        self.assertFalse(any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                             and node.func.attr == "show_panel"
+                             for stmt in fallback.orelse for node in ast.walk(stmt)))
 
     def test_cards_are_not_gated_by_panel_visibility_at_startup(self):
         source = (SRC / "app.py").read_text(encoding="utf-8")

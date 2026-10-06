@@ -16,7 +16,10 @@ class PiPToggleContractTests(unittest.TestCase):
         self.assertIn("self.app.defer(self.app.toggle_card_source, self)", self.app_text)
 
     def test_visible_source_is_parked_not_minimized(self):
-        self.assertIn("winapi.park_window_offscreen_sync(hwnd)", self.app_text)
+        # The park call now also passes a recovery hook; what matters here is
+        # that a visible source is parked off-screen and never minimized.
+        self.assertIn("winapi.park_window_offscreen_sync(", self.app_text)
+        self.assertIn("before_park=", self.app_text)
         self.assertNotIn("winapi.minimize_window(hwnd)", self.app_text)
         self.assertIn("SWP_ASYNCWINDOWPOS", self.winapi_text)
 
