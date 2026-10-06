@@ -55,14 +55,46 @@ class GuardianHandshakeTests(unittest.TestCase):
     def test_failed_startup_cleans_the_launcher_and_its_child(self):
         with tempfile.TemporaryDirectory() as tmp:
             marker = Path(tmp) / "child.pid"
+            go = Path(tmp) / "go"
             script = (
                 "import subprocess,sys,time\n"
                 "from pathlib import Path\n"
+                f"go=Path({str(go)!r})\n"
+                "while not go.exists(): time.sleep(.01)\n"
                 "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n"
                 f"Path({str(marker)!r}).write_text(str(child.pid))\n"
                 "time.sleep(60)\n"
             )
-            with patch.object(restoreguard, "guardian_command", return_value=[sys.executable, "-c", script]):
+            real_wait_for_token = restoreguard._wait_for_token
+
+            def wait_after_adoption(process, timeout, prefix=restoreguard.GUARDIAN_READY_TOKEN):
+                # _spawn calls _wait_for_token only after the launcher has been
+                # adopted into the temporary kill-on-close job.  Release the
+                # fake launcher here so its child is deterministically born into
+                # that job rather than racing the adoption call.
+                go.touch()
+                return real_wait_for_token(process, timeout, prefix)
+
+            # This test is about *failed-startup tree cleanup*, not about whether
+            # the machine hosting the test permits CREATE_BREAKAWAY_FROM_JOB.
+            # GitHub-hosted Windows runners may themselves live in a Job Object
+            # that denies breakaway, in which case production correctly fails
+            # closed before a fake launcher can start.  Exercise the later cleanup
+            # branch deterministically while leaving production policy unchanged.
+            with (
+                patch.object(
+                    restoreguard,
+                    "guardian_command",
+                    return_value=[sys.executable, "-c", script],
+                ),
+                patch.object(
+                    restoreguard,
+                    "_guardian_creation_flags",
+                    return_value=restoreguard._CREATE_NO_WINDOW,
+                ),
+                patch.object(restoreguard, "process_in_any_job", return_value=False),
+                patch.object(restoreguard, "_wait_for_token", side_effect=wait_after_adoption),
+            ):
                 started = time.monotonic()
                 self.assertIsNone(restoreguard.spawn_guardian(Path(tmp) / "journal", timeout=2))
                 self.assertLess(time.monotonic() - started, 10)
