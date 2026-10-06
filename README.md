@@ -324,7 +324,7 @@ Production-сборка выполняется только на CPython 3.14 x6
 ├── splash.png      — splash для onefile bootloader
 
 ├── arch.bat        — архив исходников в корень проекта
-├── run.bat         — запуск последнего exe из dist\
+├── run.bat         — запуск dist\LookUpWindows.exe (единственного артефакта)
 ├── dist/           — собранные exe
 ├── README.md
 └── ROADMAP.md

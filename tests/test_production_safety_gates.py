@@ -1,22 +1,22 @@
-"""Behavioural regressions for the 6 October 2026 production audit.
+"""Behavioural regressions for the production recovery path (R01-R11).
 
-Each class executes the failure the audit reported instead of grepping for a name:
-the findings are all of the shape "a mutation, a failed restore or a failed query
+Each class executes the failure it was written for instead of grepping for a name:
+the cases are all of the shape "a mutation, a failed restore or a failed query
 was read as a completed recovery", and only real behaviour can prove that the
-reading is gone.  The audit's own identifiers are used verbatim so a failure points
-back at the report.
+reading is gone.  Each case carries an R-number so a failure names its own
+section, and the series continues in test_recovery_ownership.py (R12-R14).
 
-    F01  a journal mutation may not erase a partly damaged document's obligation
-    F02  a failed restore is not a completed recovery
-    F03  the executor does not walk away from unresolved damage
-    F04  more than three failed guardian launches do not end the supervision
-    F05  an exception after the move keeps the recovered state
-    F06  no blocking recovery work runs on the UI thread, and there is no fallback
-    F07  an unanswered identity query is UNKNOWN, never REUSED
-    F08  a parked window stays identifiable after the monitor layout changes
-    F09  a park waits for a confirmed executor, and the record survives a crash
-    F10  a published checksum describes the bytes that are actually shipped
-    F11  the release gate runs the scenario registry itself
+    R01  a journal mutation may not erase a partly damaged document's obligation
+    R02  a failed restore is not a completed recovery
+    R03  the executor does not walk away from unresolved damage
+    R04  more than three failed guardian launches do not end the supervision
+    R05  an exception after the move keeps the recovered state
+    R06  no blocking recovery work runs on the UI thread, and there is no fallback
+    R07  an unanswered identity query is UNKNOWN, never REUSED
+    R08  a parked window stays identifiable after the monitor layout changes
+    R09  a park waits for a confirmed executor, and the record survives a crash
+    R10  a published checksum describes the bytes that are actually shipped
+    R11  the release gate runs the scenario registry itself
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ def make_record(hwnd: int = 4242, **overrides) -> ParkRecord:
     values = {
         "hwnd": hwnd,
         "pid": 1234,
-        "class_name": "AuditWindow",
+        "class_name": "SampleWindow",
         "process_name": "a.exe",
         "process_created": 999,
         "screen_rect": (10, 10, 310, 210),
@@ -75,7 +75,7 @@ def make_record(hwnd: int = 4242, **overrides) -> ParkRecord:
         "owner_run_id": OWNER_RUN_ID,
         "owner_created": 555,
         "recorded_at": time.time(),
-        "label": "a.exe - Audit",
+        "label": "a.exe - sample",
         "state": "parked",
         "operation_id": "op" + f"{hwnd:028d}",
         "park_rect": (-299, -199, 1, 1),
@@ -118,7 +118,7 @@ class FakeWinapi:
         self.onscreen = onscreen
         self.swept: list[set] = []
         self.pid = 1234
-        self.class_name = "AuditWindow"
+        self.class_name = "SampleWindow"
         self.created = 999
         self.alive = True
         self.restore_calls = 0
@@ -223,7 +223,7 @@ class JournalCase(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# F01 - a mutation may not erase a partly damaged document's obligation
+# R01 - a mutation may not erase a partly damaged document's obligation
 # --------------------------------------------------------------------------- #
 class DurableSalvageTests(JournalCase):
     def test_claiming_an_unrelated_record_keeps_the_broken_one_on_disk(self):
@@ -232,7 +232,7 @@ class DurableSalvageTests(JournalCase):
         self.assertEqual(before.status, JOURNAL_STATUS_DEGRADED)
         self.assertEqual([record.hwnd for record in before.unresolved], [102])
 
-        # The audit's exact sequence: claim a *good* record, then read again.
+        # The failing sequence: claim a *good* record, then read again.
         claimer = RecoveryJournal(self.path)
         claim = claimer.claim(101, executor("claimer"))
         self.assertIsNotNone(claim)
@@ -339,7 +339,7 @@ class SnapshotContractTests(JournalCase):
 
 
 # --------------------------------------------------------------------------- #
-# F02 - a failed restore is not a completed recovery
+# R02 - a failed restore is not a completed recovery
 # --------------------------------------------------------------------------- #
 class SweepDecisionTests(JournalCase):
     def damage(self):
@@ -401,7 +401,7 @@ class SweepDecisionTests(JournalCase):
     def test_the_winapi_sweep_reports_pending_and_unknown_instead_of_nothing(self):
         if winapi is None:  # pragma: no cover - non-Windows
             self.skipTest("winapi requires Windows")
-        # The audit's geometry: one parked window whose restore keeps failing, and a
+        # The geometry: one parked window whose restore keeps failing, and a
         # desktop that cannot be enumerated.
         parked = SimpleNamespace(parked=True, onscreen=False, own_pid=0)
         with patch.object(winapi, "enumerate_recovery_windows", return_value=((77,), True)), patch.object(
@@ -432,7 +432,7 @@ class SweepDecisionTests(JournalCase):
 
 
 # --------------------------------------------------------------------------- #
-# F03 - the executor does not walk away from unresolved damage
+# R03 - the executor does not walk away from unresolved damage
 # --------------------------------------------------------------------------- #
 class GuardianExitTests(JournalCase):
     def guardian(self, journal):
@@ -507,7 +507,7 @@ class GuardianExitTests(JournalCase):
 
 
 # --------------------------------------------------------------------------- #
-# F04 - the supervision does not end after three failed launches
+# R04 - the supervision does not end after three failed launches
 # --------------------------------------------------------------------------- #
 class SupervisorTests(JournalCase):
     def app(self, **overrides):
@@ -627,7 +627,7 @@ class SupervisorTests(JournalCase):
 
 
 # --------------------------------------------------------------------------- #
-# F05 - an exception after the move keeps the recovery state
+# R05 - an exception after the move keeps the recovery state
 # --------------------------------------------------------------------------- #
 class PostParkStateTests(unittest.TestCase):
     def app(self, **overrides):
@@ -735,7 +735,7 @@ class PostParkStateTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# F06 - no blocking recovery work on the UI thread
+# R06 - no blocking recovery work on the UI thread
 # --------------------------------------------------------------------------- #
 class ShutdownBoundaryTests(unittest.TestCase):
     def test_quit_only_publishes_the_request(self):
@@ -789,13 +789,13 @@ class ShutdownBoundaryTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# F07 - an unanswered identity query is UNKNOWN
+# R07 - an unanswered identity query is UNKNOWN
 # --------------------------------------------------------------------------- #
 @unittest.skipIf(winapi is None, "winapi requires Windows")
 class IdentityProbeTests(unittest.TestCase):
     STATE = SimpleNamespace(
         pid=1234,
-        class_name="AuditWindow",
+        class_name="SampleWindow",
         process_name="a.exe",
         process_created=999,
         placement=None,
@@ -811,25 +811,25 @@ class IdentityProbeTests(unittest.TestCase):
             return winapi.classify_parked_window(4242, self.STATE)
 
     def test_a_live_window_whose_pid_query_failed_is_unknown(self):
-        self.assertEqual(self.verdict(pid=0, class_name="AuditWindow"), winapi.VERIFY_UNKNOWN)
+        self.assertEqual(self.verdict(pid=0, class_name="SampleWindow"), winapi.VERIFY_UNKNOWN)
 
     def test_a_live_window_whose_class_query_failed_is_unknown(self):
         self.assertEqual(self.verdict(pid=1234, class_name=""), winapi.VERIFY_UNKNOWN)
 
     def test_a_successful_mismatch_is_still_reused(self):
-        self.assertEqual(self.verdict(pid=999999, class_name="AuditWindow"), winapi.VERIFY_REUSED)
+        self.assertEqual(self.verdict(pid=999999, class_name="SampleWindow"), winapi.VERIFY_REUSED)
         self.assertEqual(self.verdict(pid=1234, class_name="Other"), winapi.VERIFY_REUSED)
-        self.assertEqual(self.verdict(pid=1234, class_name="AuditWindow", created=1), winapi.VERIFY_REUSED)
+        self.assertEqual(self.verdict(pid=1234, class_name="SampleWindow", created=1), winapi.VERIFY_REUSED)
 
     def test_a_gone_window_is_gone(self):
-        self.assertEqual(self.verdict(pid=1234, class_name="AuditWindow", alive=False), winapi.VERIFY_GONE)
+        self.assertEqual(self.verdict(pid=1234, class_name="SampleWindow", alive=False), winapi.VERIFY_GONE)
 
     def test_the_executor_uses_the_same_verdicts(self):
         record = make_record()
         layer = SimpleNamespace(
             is_window=lambda h: True,
             get_pid=lambda h: 0,
-            get_class_name=lambda h: "AuditWindow",
+            get_class_name=lambda h: "SampleWindow",
             _query_process_identity=lambda pid, query_name=True: SimpleNamespace(created=999, name="a.exe"),
             is_stranded_park=lambda h, **kwargs: False,
             is_effectively_onscreen=lambda h, min_visible=24: False,
@@ -838,7 +838,7 @@ class IdentityProbeTests(unittest.TestCase):
         layer.get_pid = lambda h: 1234
         layer.get_class_name = lambda h: ""
         self.assertEqual(restoreguard.assess(layer, record), restoreguard.STATUS_UNVERIFIED)
-        layer.get_class_name = lambda h: "AuditWindow"
+        layer.get_class_name = lambda h: "SampleWindow"
         self.assertEqual(restoreguard.assess(layer, record), restoreguard.STATUS_OFFSCREEN)
 
     def test_the_probe_helpers_report_a_missing_answer(self):
@@ -847,7 +847,7 @@ class IdentityProbeTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# F08 - a parked window stays identifiable after the monitor layout changes
+# R08 - a parked window stays identifiable after the monitor layout changes
 # --------------------------------------------------------------------------- #
 @unittest.skipIf(winapi is None, "winapi requires Windows")
 class ParkIdentityTests(unittest.TestCase):
@@ -859,7 +859,7 @@ class ParkIdentityTests(unittest.TestCase):
         ]
         winapi.user32.CreateWindowExW.restype = ctypes.c_void_p
         self.hwnd = int(winapi.user32.CreateWindowExW(
-            0, "STATIC", "luw audit probe", 0x00CF0000 | 0x10000000,
+            0, "STATIC", "luw sample probe", 0x00CF0000 | 0x10000000,
             40, 40, 300, 200, None, None, None, 0,
         ))
         self.assertTrue(self.hwnd, "could not create the probe window")
@@ -872,7 +872,7 @@ class ParkIdentityTests(unittest.TestCase):
             pass
 
     def shift_virtual_origin(self, offset: int = -1920):
-        """Pretend a monitor was added on the left, exactly as the audit did."""
+        """Pretend a monitor was added on the left, as a second screen would."""
         original = winapi.user32.GetSystemMetrics
         indices = {
             winapi.SM_XVIRTUALSCREEN: offset,
@@ -968,7 +968,7 @@ class ParkIdentityTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# F09/F10/F11 - release-side regressions
+# R09/R10/R11 - release-side regressions
 # --------------------------------------------------------------------------- #
 class ReleaseContractTests(unittest.TestCase):
     def test_the_pre_park_gate_waits_for_a_confirmed_executor(self):

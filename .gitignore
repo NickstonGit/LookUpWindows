@@ -31,12 +31,6 @@ venv/
 *.tmp
 *.zip
 *.7z
-lookup_patch.diff
-out.txt
-
-# Agent tooling that is not part of the product
-.clinerules
-.kilocode/
 
 # Windows
 Thumbs.db

@@ -1,4 +1,4 @@
-"""Regressions for the 2026-10-06 follow-up audit overlay."""
+"""Regressions for the second wave of release-integrity fixes."""
 from __future__ import annotations
 
 import ast

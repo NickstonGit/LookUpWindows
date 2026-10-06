@@ -2,12 +2,14 @@
 
 Every test here maps to a failure mode that used to lose a user's window:
 
-* a guardian that gave up after a hard lifetime (P1-01),
-* a PID-reuse block that froze recovery forever (P1-02),
+* a guardian that gave up after a hard lifetime (R12),
+* a PID-reuse block that froze recovery forever (R13),
 * a stale executor that could clear a newer claim (ABA),
-* non-finite control values that locked a record permanently (P2-01),
+* non-finite control values that locked a record permanently (R14),
 * and an accessibility predicate that called a window visible while it sat in the
   gap between two monitors.
+
+The R-series continues test_production_safety_gates.py (R01-R11).
 """
 
 from __future__ import annotations
@@ -141,7 +143,7 @@ def finished_pid() -> int:
 
 
 class GuardianLifetimeTests(unittest.TestCase):
-    """P1-01: an executor must never stop executing a live obligation."""
+    """R12: an executor must never stop executing a live obligation."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -332,7 +334,7 @@ class ClaimFencingTests(unittest.TestCase):
 
 
 class OwnerPidReuseTests(unittest.TestCase):
-    """P1-02: the owner of an obligation is an identity, not a number."""
+    """R13: the owner of an obligation is an identity, not a number."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -369,7 +371,7 @@ class OwnerPidReuseTests(unittest.TestCase):
 
 
 class LeasePoisoningTests(unittest.TestCase):
-    """P2-01: a non-finite control value may not lock a record forever."""
+    """R14: a non-finite control value may not lock a record forever."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

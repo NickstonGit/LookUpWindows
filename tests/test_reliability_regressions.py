@@ -1,4 +1,4 @@
-"""Failure paths and process boundaries behind the production audit fixes."""
+"""Failure paths and process boundaries behind the production recovery fixes."""
 
 import hashlib
 import json
@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from test_production_audit_gates import (
+from test_production_safety_gates import (
     AppMethod, FakeWinapi, JournalCase, ParkIdentityTests, SweepResult, executor, make_record,
 )
 

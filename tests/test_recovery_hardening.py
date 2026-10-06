@@ -5,21 +5,23 @@ each one *executes* the behaviour rather than grepping for it: a static check ca
 only prove that a name is still in the source, never that a journal entry
 survives a hostile condition.
 
-The families:
+The families (the R-series continues test_production_safety_gates.py and
+test_recovery_ownership.py, which hold R01-R14):
 
-* F01 the executor mutex belongs to a journal, not to a session;
-* F02 the two-stage handover reads both tokens from one live pipe;
-* F03 "cannot judge now" is not "not ours any more";
-* F04 a park operation may not adopt somebody else's obligation;
-* F05 a missing optional field is data we do not have, not an exception;
-* F06 a quarantined journal is unresolved, not empty;
-* F07 the writer may not produce a document its own reader quarantines;
-* F08 an unknown journal state never ends the executor;
-* F09 startup leftovers get an executor that outlives the session;
-* F10 visibility, not geometry, decides whether a window is back;
-* F12 any qualifying monitor intersection makes a window accessible;
-* F13 a confirmed save must load back;
-* F14 an unconfirmed guardian launch is owned by a kill-on-close job.
+* R15 the executor mutex belongs to a journal, not to a session;
+* R16 the two-stage handover reads both tokens from one live pipe;
+* R17 "cannot judge now" is not "not ours any more";
+* R18 a park operation may not adopt somebody else's obligation;
+* R19 a missing optional field is data we do not have, not an exception;
+* R20 a quarantined journal is unresolved, not empty;
+* R21 the writer may not produce a document its own reader quarantines;
+* R22 an unknown journal state never ends the executor;
+* R23 startup leftovers get an executor that outlives the session;
+* R24 visibility, not geometry, decides whether a window is back;
+* R25 no blocking journal or guardian work on the UI thread;
+* R26 any qualifying monitor intersection makes a window accessible;
+* R27 a confirmed save must load back;
+* R28 an unconfirmed guardian launch is owned by a kill-on-close job.
 """
 
 from __future__ import annotations
@@ -223,7 +225,7 @@ def app_method(class_name: str, method_name: str, namespace: dict):
 
 
 # --------------------------------------------------------------------------- #
-# F01 - the executor mutex belongs to a journal, not to a session
+# R15 - the executor mutex belongs to a journal, not to a session
 # --------------------------------------------------------------------------- #
 @unittest.skipIf(os.name != "nt", "named mutexes are Windows only")
 class PerJournalExecutorMutexTests(unittest.TestCase):
@@ -283,7 +285,7 @@ class PerJournalExecutorMutexTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# F02 - the two-stage handover reads both tokens from one live pipe
+# R16 - the two-stage handover reads both tokens from one live pipe
 # --------------------------------------------------------------------------- #
 class TwoStageHandshakeTests(unittest.TestCase):
     """`started` then `ready` must both arrive on the same, still-open pipe."""
@@ -389,7 +391,7 @@ class TwoStageHandshakeTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# F03 - "cannot judge now" is not "not ours any more"
+# R17 - "cannot judge now" is not "not ours any more"
 # --------------------------------------------------------------------------- #
 class ParkedWindowVerdictTests(unittest.TestCase):
     """One verdict for every caller, with an explicit 'unknown'."""
@@ -511,7 +513,7 @@ class UnverifiableIdentityKeepsTheRecordTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# F04 - a park may not adopt somebody else's obligation
+# R18 - a park may not adopt somebody else's obligation
 # --------------------------------------------------------------------------- #
 class TransactionalIntentTests(unittest.TestCase):
     def setUp(self):
@@ -588,7 +590,7 @@ class TransactionalIntentTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# F05 - a missing optional field is not an exception
+# R19 - a missing optional field is not an exception
 # --------------------------------------------------------------------------- #
 class ParserContractTests(unittest.TestCase):
     def setUp(self):
@@ -664,7 +666,7 @@ class ParserContractTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# F06 - a quarantined journal is unresolved, not empty
+# R20 - a quarantined journal is unresolved, not empty
 # --------------------------------------------------------------------------- #
 class QuarantineIsNotEmptinessTests(unittest.TestCase):
     def setUp(self):
@@ -783,7 +785,7 @@ class QuarantineIsNotEmptinessTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# F07 - the writer may not produce a document its reader quarantines
+# R21 - the writer may not produce a document its reader quarantines
 # --------------------------------------------------------------------------- #
 class WriterSharesTheReaderContractTests(unittest.TestCase):
     def setUp(self):
@@ -869,7 +871,7 @@ class WriterSharesTheReaderContractTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# F09 - startup leftovers get an executor that outlives the session
+# R23 - startup leftovers get an executor that outlives the session
 # --------------------------------------------------------------------------- #
 class FakeGuardian:
     """A guardian process handle: alive until it is told to exit."""
@@ -1050,7 +1052,7 @@ class StartupSupervisorTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# F10 - visibility, not geometry, decides whether a window is back
+# R24 - visibility, not geometry, decides whether a window is back
 # --------------------------------------------------------------------------- #
 @unittest.skipIf(winapi is None, "winapi requires Windows")
 class AccessibilityPredicateTests(unittest.TestCase):
@@ -1123,7 +1125,7 @@ class AccessibilityPredicateTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# F12 - any qualifying monitor intersection makes a window accessible
+# R26 - any qualifying monitor intersection makes a window accessible
 # --------------------------------------------------------------------------- #
 class MonitorThresholdTests(unittest.TestCase):
     WINDOW = (0, 0, 1000, 1000)
@@ -1154,7 +1156,7 @@ class MonitorThresholdTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# F13 - a confirmed save must load back
+# R27 - a confirmed save must load back
 # --------------------------------------------------------------------------- #
 class SettingsSizeContractTests(unittest.TestCase):
     def setUp(self):
@@ -1194,7 +1196,7 @@ class SettingsSizeContractTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# F14 - an unconfirmed guardian launch is owned by a kill-on-close job
+# R28 - an unconfirmed guardian launch is owned by a kill-on-close job
 # --------------------------------------------------------------------------- #
 @unittest.skipIf(os.name != "nt", "Job Objects are Windows only")
 class GuardianLaunchOwnershipTests(unittest.TestCase):
@@ -1331,7 +1333,7 @@ class GuardianLaunchOwnershipTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# F11 - no blocking journal or guardian work on the UI thread
+# R25 - no blocking journal or guardian work on the UI thread
 # --------------------------------------------------------------------------- #
 class UiThreadOffloadTests(unittest.TestCase):
     def test_the_ui_paths_do_no_journal_io(self):
