@@ -47,8 +47,9 @@ below, and each scenario states the invariant it enforces:
   but on no monitor (the gap of an L-shaped layout) must count as *not*
   visible, so recovery cannot report success for an unreachable window.
 * ``outerjob``    - run a guardian launch from a process deliberately placed in
-  a no-breakaway Windows Job Object: the application must reject that guardian
-  instead of accepting an executor that can be killed together with its owner.
+  a kill-on-close Windows Job Object that forbids breakaway: the application must
+  reject that guardian instead of accepting an executor that can be killed
+  together with its owner.
 
 Usage::
 
@@ -1806,6 +1807,10 @@ def scenario_outerjob(args, exe, settings, target) -> None:
     artifact. Accepting that child would recreate the production failure: a
     launcher closing/terminating the outer job could kill LookUp and its recovery
     executor together.
+
+    The helper also reports the job context it was launched under, so the gate
+    proves it exercised the hostile-job refusal rather than passing because
+    something unrelated happened to fail.
     """
     go = settings.parent / "outerjob.go"
     journal = Path(str(settings) + ".park.json")
@@ -1824,6 +1829,7 @@ import restoreguard
 
 while not go.exists():
     time.sleep(0.01)
+context = restoreguard.enclosing_job()
 if mode == "exe":
     command = [exe, restoreguard.GUARDIAN_ARG, str(journal), "0", "0", ""]
 else:
@@ -1835,6 +1841,7 @@ process = restoreguard._spawn(
     command, timeout=8.0, expect=restoreguard.GUARDIAN_READY_TOKEN
 )
 print(json.dumps({"accepted": process is not None,
+                  "job_context": context.kind,
                   "pid": int(process.pid) if process is not None else 0}), flush=True)
 if process is not None:
     restoreguard._link_for(process).close()
@@ -1880,6 +1887,12 @@ if process is not None:
             raise SmokeError(
                 "a recovery guardian trapped in an enclosing Job Object was accepted "
                 f"as independent (pid={result.get('pid')})"
+            )
+        if result.get("job_context") != restoreguard.GUARDIAN_CONTEXT_HOSTILE:
+            raise SmokeError(
+                "the outer-job helper did not run under a kill-on-close Job Object "
+                f"(reported {result.get('job_context')!r}), so it proved nothing about "
+                "the hostile-job refusal"
             )
         log("guardian launch correctly failed closed inside a no-breakaway outer Job Object")
     finally:
@@ -1959,7 +1972,7 @@ def run(args: argparse.Namespace) -> int:
             return run_tail(args)
 
 
-def run_tail(args) -> int:
+def wait_for_executor_exit(args) -> None:
     """The end of every scenario: nothing may be left running behind it.
 
     A guardian is *expected* to outlive the process that started it - that is what
@@ -1972,6 +1985,16 @@ def run_tail(args) -> int:
         interval=0.5,
         what="the recovery guardian to exit with its partner",
     )
+
+
+def run_tail(args) -> int:
+    """Wait for the tail of a scenario that reached it, and report that it passed.
+
+    ``PASS`` belongs to the scenario, not to this wait: a caller that is already
+    handling a failure uses :func:`wait_for_executor_exit` instead, so a failed
+    scenario can never print a pass for the cleanup that followed it.
+    """
+    wait_for_executor_exit(args)
     log("PASS")
     return 0
 
@@ -1996,8 +2019,10 @@ def run_all(args) -> int:
             log(f"--- scenario {name} FAILED: {exc}")
             # A failed scenario has already closed its targets and owner. Let its
             # guardian finish before a subsequent scenario checks for survivors.
+            # This is cleanup, not a result: reporting it as a pass would contradict
+            # the failure recorded right above.
             try:
-                run_tail(args)
+                wait_for_executor_exit(args)
             except SmokeError as cleanup_error:
                 failures.append(f"{name} cleanup: {cleanup_error}")
             continue

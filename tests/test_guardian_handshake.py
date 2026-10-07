@@ -77,10 +77,14 @@ class GuardianHandshakeTests(unittest.TestCase):
 
             # This test is about *failed-startup tree cleanup*, not about whether
             # the machine hosting the test permits CREATE_BREAKAWAY_FROM_JOB.
-            # GitHub-hosted Windows runners may themselves live in a Job Object
-            # that denies breakaway, in which case production correctly fails
-            # closed before a fake launcher can start.  Exercise the later cleanup
-            # branch deterministically while leaving production policy unchanged.
+            # GitHub-hosted Windows runners may themselves live in a Job Object,
+            # and a job the host puts us in decides whether production starts a
+            # guardian at all.  Pin the launch decision and exercise the later
+            # cleanup branch deterministically while leaving production policy
+            # unchanged.
+            unjobbed = restoreguard.EnclosingJob(
+                restoreguard.GUARDIAN_CONTEXT_NONE, None
+            )
             with (
                 patch.object(
                     restoreguard,
@@ -92,6 +96,7 @@ class GuardianHandshakeTests(unittest.TestCase):
                     "_guardian_creation_flags",
                     return_value=restoreguard._CREATE_NO_WINDOW,
                 ),
+                patch.object(restoreguard, "enclosing_job", return_value=unjobbed),
                 patch.object(restoreguard, "process_in_any_job", return_value=False),
                 patch.object(restoreguard, "_wait_for_token", side_effect=wait_after_adoption),
             ):

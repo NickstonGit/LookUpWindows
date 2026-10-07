@@ -9,6 +9,7 @@ process.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -16,6 +17,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
@@ -631,10 +633,64 @@ class HandoverContractTests(unittest.TestCase):
         self.assertIn("_CREATE_BREAKAWAY_FROM_JOB", GUARD)
         self.assertIn("close_fds=True", GUARD)
 
+    def test_the_executor_is_allowed_only_outside_a_kill_on_close_job(self):
+        # Membership in *some* job is not evidence of danger: an ordinary job,
+        # or none, is where a supervised desktop application normally runs.  Only
+        # a confirmed kill-on-close job that forbids breakaway forbids the
+        # guardian, and park fails closed with it.
+        classify = GUARD.split("def _classify_job_flags", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE", classify)
+        self.assertIn("can_escape", classify)
+        read = GUARD.split("def enclosing_job", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("QueryInformationJobObject(", read)
+        self.assertIn("_classify_job_flags(flags)", read)
+        self.assertIn(
+            "GUARDIAN_CONTEXT_NONE, GUARDIAN_CONTEXT_ORDINARY",
+            GUARD.split("def permits_guardian", 1)[1].split("\ndef ", 1)[0],
+            "only those two job contexts may carry a recovery executor",
+        )
+        self.assertFalse(
+            restoreguard.EnclosingJob(restoreguard.GUARDIAN_CONTEXT_UNREADABLE, None).permits_guardian,
+            "a job whose limits cannot be read is not an ordinary job",
+        )
+        self.assertIn(
+            "EnclosingJob(GUARDIAN_CONTEXT_UNREADABLE, None)",
+            read,
+            "an unreadable job has to be classified, not silently treated as ordinary",
+        )
+
+    def test_the_two_breakaway_limits_stay_separate(self):
+        # SILENT_BREAKAWAY_OK detaches children by itself and forbids
+        # CREATE_BREAKAWAY_FROM_JOB unless BREAKAWAY_OK is also set, so treating
+        # the two limits as one is not a simplification but a failed launch.
+        model = GUARD.split("class EnclosingJob", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("def explicit_breakaway", model)
+        self.assertIn("def silent_breakaway", model)
+        self.assertIn("def can_escape", model)
+        self.assertNotIn("def breaks_away", model)
+        flags = GUARD.split("def _guardian_creation_flags", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("enclosing.explicit_breakaway", flags)
+        self.assertNotIn(
+            "enclosing.can_escape",
+            flags,
+            "can_escape answers 'may the child leave', not 'is the flag legal'",
+        )
+
+    def test_guardian_refusal_is_decided_before_anything_is_launched(self):
+        spawn = GUARD.split("def _spawn", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("if not enclosing.permits_guardian:", spawn)
+        self.assertLess(
+            spawn.index("if not enclosing.permits_guardian:"),
+            spawn.index("subprocess.Popen("),
+            "a hostile enclosing job must be refused before a process is created",
+        )
+        self.assertIn("_guardian_creation_flags(enclosing)", spawn)
+
     def test_guardian_breakaway_is_fail_closed_and_verified(self):
         spawn = GUARD.split("def _spawn", 1)[1].split("\ndef ", 1)[0]
         self.assertIn("process_in_any_job(process)", spawn)
-        self.assertIn("if inherited_job is not False", spawn)
+        self.assertIn("if inherited_job is None:", spawn)
+        self.assertIn("enclosing.kind == GUARDIAN_CONTEXT_NONE and inherited_job", spawn)
         self.assertIn("if not job.adopt(process)", spawn)
         self.assertIn("breakaway was denied", spawn)
         self.assertNotIn("starting it inside", spawn)
@@ -645,6 +701,406 @@ class HandoverContractTests(unittest.TestCase):
         self.assertIn("restoreguard.resolve_all", APP)
         self.assertIn("restoreguard.resolve(", APP)
         self.assertIn("self._executor", APP)
+
+
+JOB_REPORT_CHILD = r"""import ctypes
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, {src!r})
+import restoreguard
+
+go, out, job_name = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+while not go.exists():
+    time.sleep(0.01)
+context = restoreguard.enclosing_job()
+creationflags = restoreguard._guardian_creation_flags(context)
+report = {{
+    "kind": context.kind,
+    "flags": context.limit_flags,
+    "explicit": context.explicit_breakaway,
+    "silent": context.silent_breakaway,
+    "can_escape": context.can_escape,
+    "permits": context.permits_guardian,
+    "requested_breakaway": bool(creationflags & restoreguard._CREATE_BREAKAWAY_FROM_JOB),
+}}
+# Launching a throwaway child is what makes the two breakaway limits separable
+# in practice instead of only in theory: a silent-breakaway job detaches the
+# child by itself, and a job that granted only the silent one rejects
+# CREATE_BREAKAWAY_FROM_JOB outright - so a wrong request shows up here as a
+# real OS failure rather than as a difference nobody can observe.
+try:
+    child = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        creationflags=creationflags,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+except OSError as exc:
+    report["child_launched"] = False
+    report["child_error"] = getattr(exc, "winerror", None)
+    report["child_in_this_job"] = None
+else:
+    with child:
+        report["child_launched"] = True
+        # Membership of *this* job, asked with that job's own handle: "is the
+        # child in some job" cannot answer it, because a child that did break
+        # away is still legitimately inside the job the test host itself runs
+        # in.  None means the question could not be asked, never "yes".
+        report["child_in_this_job"] = None
+        kernel32 = restoreguard._job_kernel32()
+        job = kernel32.OpenJobObjectW(restoreguard._JOB_OBJECT_ALL_ACCESS, False, job_name)
+        if job:
+            try:
+                in_job = ctypes.c_int()
+                if kernel32.IsProcessInJob(child._handle, job, ctypes.byref(in_job)):
+                    report["child_in_this_job"] = bool(in_job.value)
+            finally:
+                kernel32.CloseHandle(job)
+out.write_text(json.dumps(report), encoding="utf-8")
+"""
+
+
+class JobLimitConstantTests(unittest.TestCase):
+    """The limit flags of ``JOBOBJECT_BASIC_LIMIT_INFORMATION``, spelled out.
+
+    Everything else in this file reads the flags back out of the module that
+    also interprets them, so it cannot catch a wrong bit: with the old values
+    the whole suite agreed with itself while reading a real kill-on-close job
+    with real breakaway as a job nobody can leave.  0x00004000 is
+    ``JOB_OBJECT_LIMIT_SUBSET_AFFINITY`` and 0x08000000 is not a job limit at
+    all, so the numbers are asserted here against what WinNT.h defines.
+    """
+
+    def test_the_job_limits_are_the_values_win32_defines(self):
+        self.assertEqual(restoreguard._JOB_OBJECT_LIMIT_BREAKAWAY_OK, 0x00000800)
+        self.assertEqual(restoreguard._JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, 0x00001000)
+        self.assertEqual(restoreguard._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, 0x00002000)
+
+    def test_the_breakaway_limits_do_not_alias_the_creation_flag(self):
+        # 0x08000000 was carried here as "breakaway ok"; it is CREATE_NO_WINDOW,
+        # and reading it back out of LimitFlags could never match a real job.
+        for flag in (
+            restoreguard._JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+            restoreguard._JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+            restoreguard._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        ):
+            with self.subTest(flag=hex(flag)):
+                self.assertNotEqual(flag, restoreguard._CREATE_NO_WINDOW)
+                self.assertNotEqual(flag, restoreguard._CREATE_BREAKAWAY_FROM_JOB)
+
+    def test_the_two_breakaway_limits_are_independent_bits(self):
+        flags = (
+            restoreguard._JOB_OBJECT_LIMIT_BREAKAWAY_OK
+            | restoreguard._JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
+            | restoreguard._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        self.assertEqual(
+            flags
+            & (
+                restoreguard._JOB_OBJECT_LIMIT_BREAKAWAY_OK
+                | restoreguard._JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
+            ),
+            0x00001800,
+        )
+
+
+# The job limits this file configures, written out rather than read back from
+# the module under test.  Configuring a job with ``restoreguard``'s own
+# constants would let a wrong bit define the fixture and then be confirmed by
+# it - the failure that shipped, where the suite agreed with itself about a job
+# that Windows had never been asked to create.
+WIN_JOB_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+WIN_JOB_LIMIT_BREAKAWAY_OK = 0x00000800
+WIN_JOB_LIMIT_SILENT_BREAKAWAY_OK = 0x00001000
+
+
+class EnclosingJobTests(unittest.TestCase):
+    """The enclosing Job decides whether a recovery executor may exist at all.
+
+    These are real Job Objects on a real machine: the classification decides
+    whether LookUp may park a window at all, so it is checked by what Windows
+    reports rather than by what the code says about itself.
+    """
+
+    def setUp(self):
+        if os.name != "nt":
+            self.skipTest("Windows Job Objects")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def _classify_under(self, adopt, job_name: str = "") -> dict:
+        go = self.dir / "go"
+        report = self.dir / "report.json"
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                JOB_REPORT_CHILD.format(src=str(SRC)),
+                str(go),
+                str(report),
+                job_name,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        self.addCleanup(self._reap, child)
+        self.assertTrue(adopt(child), "the child could not be placed in the controlled job")
+        go.touch()
+        child.wait(timeout=60.0)
+        self.assertTrue(report.exists(), "the child reported no job context")
+        return json.loads(report.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _reap(child) -> None:
+        if child.poll() is None:
+            child.kill()
+            try:
+                child.wait(timeout=10.0)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+    def _job_with(self, limit_flags: int):
+        """A named real job with exactly these limits, and a callback to enter it.
+
+        The limits are the point: Windows refuses
+        ``CREATE_BREAKAWAY_FROM_JOB`` for a job that did not ask for it, so the
+        verdict is only observable against a job that genuinely was configured
+        the way the test claims.  The name lets the helper ask about *this* job
+        by handle instead of asking whether the child is in some job at all.
+        """
+        import ctypes
+
+        kernel32 = restoreguard._job_kernel32()
+        name = "Local\\LookUpWindows-JobProbe-%s" % os.urandom(8).hex()
+        handle = kernel32.CreateJobObjectW(None, name)
+        self.assertTrue(handle, "the controlled job could not be created")
+        self.addCleanup(kernel32.CloseHandle, ctypes.c_void_p(handle))
+        info = restoreguard._JobExtendedLimitInformation()
+        info.BasicLimitInformation.LimitFlags = limit_flags
+        self.assertTrue(
+            kernel32.SetInformationJobObject(
+                handle,
+                restoreguard._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            ),
+            f"the job rejected the limits {limit_flags:#x} (error {ctypes.get_last_error()})",
+        )
+        read_back = restoreguard._JobExtendedLimitInformation()
+        self.assertTrue(
+            kernel32.QueryInformationJobObject(
+                handle,
+                restoreguard._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                ctypes.byref(read_back),
+                ctypes.sizeof(read_back),
+                None,
+            )
+        )
+        self.assertEqual(
+            int(read_back.BasicLimitInformation.LimitFlags),
+            limit_flags,
+            "the job under test is not the job this test claims it configured",
+        )
+
+        def adopt(child):
+            return bool(kernel32.AssignProcessToJobObject(handle, ctypes.c_void_p(child._handle)))
+
+        return name, adopt
+
+    def test_a_kill_on_close_job_without_breakaway_forbids_the_guardian(self):
+        # The production failure this whole decision exists for: a launcher that
+        # closes the job takes LookUp and its executor in the same step.
+        job = restoreguard._GuardianLaunchJob()
+        self.addCleanup(job.close)
+        self.assertTrue(job.available)
+        report = self._classify_under(job.adopt, job.name)
+        self.assertEqual(report["kind"], restoreguard.GUARDIAN_CONTEXT_HOSTILE)
+        self.assertTrue(
+            report["flags"] & WIN_JOB_LIMIT_KILL_ON_JOB_CLOSE,
+            "the job under test must really be a kill-on-close one",
+        )
+        self.assertFalse(
+            report["flags"] & (WIN_JOB_LIMIT_BREAKAWAY_OK | WIN_JOB_LIMIT_SILENT_BREAKAWAY_OK),
+            "the job under test must grant no breakaway at all",
+        )
+        self.assertFalse(report["permits"])
+        self.assertFalse(report["can_escape"])
+        self.assertFalse(report["explicit"])
+        self.assertFalse(report["silent"])
+        self.assertFalse(report["requested_breakaway"])
+        # The control for the two tests below: without breakaway the child stays
+        # put, which is what makes their "the child left" result mean something.
+        self.assertTrue(report["child_launched"], report.get("child_error"))
+        self.assertIs(
+            report["child_in_this_job"],
+            True,
+            "a child of a job that forbids breakaway cannot leave it",
+        )
+
+    def test_a_kill_on_close_job_with_breakaway_ok_still_permits_the_guardian(self):
+        # Being killed with the launcher is survivable exactly when the child can
+        # be created outside that job, so the guardian must still run - and must
+        # ask for the breakaway by name, because that is the only limit that
+        # makes CREATE_BREAKAWAY_FROM_JOB legal.
+        name, adopt = self._job_with(
+            WIN_JOB_LIMIT_KILL_ON_JOB_CLOSE | WIN_JOB_LIMIT_BREAKAWAY_OK
+        )
+        report = self._classify_under(adopt, name)
+        self.assertEqual(report["kind"], restoreguard.GUARDIAN_CONTEXT_ORDINARY)
+        self.assertTrue(report["permits"])
+        self.assertTrue(report["explicit"])
+        self.assertFalse(report["silent"])
+        self.assertTrue(report["can_escape"])
+        self.assertTrue(
+            report["requested_breakaway"],
+            "BREAKAWAY_OK is what CREATE_BREAKAWAY_FROM_JOB requires",
+        )
+        self.assertTrue(report["child_launched"], report.get("child_error"))
+        self.assertIs(
+            report["child_in_this_job"],
+            False,
+            "the child has to land outside the job that would kill the owner",
+        )
+
+    def test_a_kill_on_close_job_with_silent_breakaway_permits_the_guardian(self):
+        # The silent limit detaches children by itself.  Asking for
+        # CREATE_BREAKAWAY_FROM_JOB on top is not required, and without
+        # BREAKAWAY_OK it is refused - which used to turn a launch that could
+        # have worked into a failure that then refused to park.
+        name, adopt = self._job_with(
+            WIN_JOB_LIMIT_KILL_ON_JOB_CLOSE | WIN_JOB_LIMIT_SILENT_BREAKAWAY_OK
+        )
+        report = self._classify_under(adopt, name)
+        self.assertEqual(report["kind"], restoreguard.GUARDIAN_CONTEXT_ORDINARY)
+        self.assertTrue(report["permits"])
+        self.assertTrue(report["silent"])
+        self.assertFalse(report["explicit"])
+        self.assertTrue(report["can_escape"])
+        self.assertFalse(
+            report["requested_breakaway"],
+            "a silent-breakaway job already releases children and forbids the flag",
+        )
+        self.assertTrue(report["child_launched"], report.get("child_error"))
+        self.assertIs(
+            report["child_in_this_job"],
+            False,
+            "silent breakaway has to happen by itself, with no creation flag",
+        )
+
+    def test_an_ordinary_job_still_permits_the_guardian(self):
+        # Being in *some* job is how a supervised application normally runs; it
+        # is not evidence that the job would kill the executor.
+        import ctypes
+
+        kernel32 = restoreguard._job_kernel32()
+        handle = kernel32.CreateJobObjectW(None, None)
+        self.assertTrue(handle)
+        self.addCleanup(kernel32.CloseHandle, ctypes.c_void_p(handle))
+
+        def adopt(child):
+            return bool(kernel32.AssignProcessToJobObject(handle, ctypes.c_void_p(child._handle)))
+
+        report = self._classify_under(adopt)
+        self.assertEqual(report["kind"], restoreguard.GUARDIAN_CONTEXT_ORDINARY)
+        self.assertTrue(report["permits"])
+        self.assertFalse(
+            report["flags"] & restoreguard._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            "the ordinary job under test must not be a kill-on-close one",
+        )
+        self.assertFalse(report["requested_breakaway"])
+
+    def test_the_classification_of_this_process_agrees_with_its_own_limits(self):
+        # Whichever job the machine running the tests puts this process in, the
+        # verdict has to follow the limits it actually reports - never the other
+        # way round.
+        context = restoreguard.enclosing_job()
+        self.assertIn(context.kind, (
+            restoreguard.GUARDIAN_CONTEXT_NONE,
+            restoreguard.GUARDIAN_CONTEXT_ORDINARY,
+            restoreguard.GUARDIAN_CONTEXT_HOSTILE,
+            restoreguard.GUARDIAN_CONTEXT_UNREADABLE,
+        ))
+        if context.kind in (restoreguard.GUARDIAN_CONTEXT_NONE, restoreguard.GUARDIAN_CONTEXT_UNREADABLE):
+            self.assertIsNone(context.limit_flags)
+        else:
+            flags = context.limit_flags
+            kill_on_close = bool(flags & restoreguard._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+            self.assertEqual(context.kind == restoreguard.GUARDIAN_CONTEXT_HOSTILE, kill_on_close and not context.can_escape)
+            self.assertEqual(context.permits_guardian, not kill_on_close)
+
+    def test_every_combination_of_limits_reaches_one_verdict(self):
+        # The whole policy over every job limit bit that matters, checked as a
+        # table instead of one remembered case: hostile exactly when the job
+        # kills and cannot be left, and the creation flag exactly when the job
+        # asked for breakaway by name.
+        kill = restoreguard._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        explicit = restoreguard._JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        silent = restoreguard._JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
+        for mask in range(8):
+            flags = 0
+            if mask & 1:
+                flags |= kill
+            if mask & 2:
+                flags |= explicit
+            if mask & 4:
+                flags |= silent
+            with self.subTest(flags=hex(flags)):
+                context = restoreguard.EnclosingJob(
+                    restoreguard._classify_job_flags(flags), flags
+                )
+                self.assertEqual(context.explicit_breakaway, bool(flags & explicit))
+                self.assertEqual(context.silent_breakaway, bool(flags & silent))
+                self.assertEqual(context.can_escape, bool(flags & (explicit | silent)))
+                self.assertEqual(
+                    context.kind == restoreguard.GUARDIAN_CONTEXT_HOSTILE,
+                    bool(flags & kill) and not context.can_escape,
+                )
+                self.assertEqual(
+                    context.permits_guardian, context.kind != restoreguard.GUARDIAN_CONTEXT_HOSTILE
+                )
+                requested = restoreguard._guardian_creation_flags(context)
+                self.assertEqual(
+                    bool(requested & restoreguard._CREATE_BREAKAWAY_FROM_JOB),
+                    context.explicit_breakaway,
+                    "the breakaway flag is requested only where Win32 honours it",
+                )
+                self.assertTrue(requested & restoreguard._CREATE_NO_WINDOW)
+
+    def test_breakaway_is_requested_exactly_where_it_can_be_honoured(self):
+        kill = restoreguard._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        explicit = restoreguard._JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        silent = restoreguard._JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
+        for context, expected in (
+            (restoreguard.EnclosingJob(restoreguard.GUARDIAN_CONTEXT_NONE, None), False),
+            (restoreguard.EnclosingJob(restoreguard.GUARDIAN_CONTEXT_ORDINARY, 0), False),
+            (restoreguard.EnclosingJob(restoreguard.GUARDIAN_CONTEXT_ORDINARY, explicit), True),
+            (restoreguard.EnclosingJob(restoreguard.GUARDIAN_CONTEXT_ORDINARY, silent), False),
+            (restoreguard.EnclosingJob(restoreguard.GUARDIAN_CONTEXT_ORDINARY, kill), False),
+            (restoreguard.EnclosingJob(restoreguard.GUARDIAN_CONTEXT_HOSTILE, kill), False),
+        ):
+            with self.subTest(kind=context.kind, flags=context.limit_flags):
+                requested = restoreguard._guardian_creation_flags(context)
+                self.assertEqual(
+                    bool(requested & restoreguard._CREATE_BREAKAWAY_FROM_JOB), expected
+                )
+
+    def test_a_hostile_job_refuses_the_launch_without_creating_anything(self):
+        hostile = restoreguard.EnclosingJob(
+            restoreguard.GUARDIAN_CONTEXT_HOSTILE,
+            restoreguard._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        )
+        with (
+            patch.object(restoreguard, "enclosing_job", return_value=hostile),
+            patch.object(restoreguard.subprocess, "Popen") as popen,
+        ):
+            self.assertIsNone(restoreguard._spawn(["anything"], timeout=1.0, expect=b"ready"))
+        popen.assert_not_called()
 
 
 class SmokeGateTests(unittest.TestCase):
@@ -662,6 +1118,27 @@ class SmokeGateTests(unittest.TestCase):
         self.assertIn("outer.adopt(helper)", body)
         self.assertIn("restoreguard._spawn", body)
         self.assertIn("result.get(\"accepted\")", body)
+        self.assertIn(
+            "job_context",
+            body,
+            "the gate has to prove it ran under the hostile job it set up",
+        )
+
+    def test_a_failed_scenario_never_reports_a_pass_for_its_cleanup(self):
+        runner = SMOKE.split("def run_all", 1)[1].split("\ndef ", 1)[0]
+        failed_branch = runner.split("FAILED", 1)[1]
+        self.assertIn("wait_for_executor_exit(args)", failed_branch)
+        self.assertNotIn(
+            "run_tail(",
+            failed_branch,
+            "the cleanup after a FAILED scenario must not print a PASS of its own",
+        )
+        self.assertEqual(
+            SMOKE.count('log("PASS")'),
+            1,
+            "only the pass of a scenario itself may be reported as a pass",
+        )
+        self.assertIn("log(\"PASS\")", SMOKE.split("def run_tail", 1)[1].split("\ndef ", 1)[0])
 
     def test_the_lifetime_gate_watches_an_executor_that_never_gives_up(self):
         # The regression this gate exists for: an executor that reached a lifetime

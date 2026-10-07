@@ -38,6 +38,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
@@ -1022,7 +1023,14 @@ def _wait_for_token(process: subprocess.Popen, timeout: float, prefix: bytes = G
 # Ownership of an unconfirmed guardian launch
 # --------------------------------------------------------------------------- #
 
+# The limit flags of JOBOBJECT_BASIC_LIMIT_INFORMATION, as WinNT.h defines them.
+# They are written out rather than imported because a wrong bit here is silent:
+# 0x00004000 is JOB_OBJECT_LIMIT_SUBSET_AFFINITY, and 0x08000000 is no limit at
+# all, so a swapped-in value makes a kill-on-close job with real breakaway look
+# like a job that cannot be left - and that refuses parking for no reason.
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
+_JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x00001000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
 _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION_CLASS = 1
 _PROCESS_SET_QUOTA = 0x0100
@@ -1109,6 +1117,8 @@ def _job_kernel32():
     kernel32.AssignProcessToJobObject.restype = ctypes.c_int
     kernel32.IsProcessInJob.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
     kernel32.IsProcessInJob.restype = ctypes.c_int
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
     kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
     kernel32.OpenProcess.restype = ctypes.c_void_p
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
@@ -1119,10 +1129,11 @@ def _job_kernel32():
 def process_in_any_job(process) -> bool | None:
     """Whether ``process`` is still attached to any pre-existing Windows job.
 
-    The recovery guardian is useful only when it can outlive the application.
-    ``CREATE_BREAKAWAY_FROM_JOB`` is therefore not merely a creation hint: after
-    the child exists we verify the result before accepting it as an executor.
-    ``None`` means the proof could not be obtained and is deliberately fail-closed.
+    ``True`` is deliberately *not* a verdict about safety: a child created with
+    ``CREATE_BREAKAWAY_FROM_JOB`` can still be reported inside a different job
+    whose limits are harmless, so membership alone says nothing about who would
+    kill it.  What decides that is :func:`enclosing_job`, read from the limits
+    of the job *this* process is running in.
     """
     if os.name != "nt":
         return False
@@ -1154,6 +1165,130 @@ def process_in_any_job(process) -> bool | None:
     except (OSError, AttributeError):  # pragma: no cover - non-Windows/defensive
         logger.exception("Recovery guardian pid=%s job membership check failed", pid)
         return None
+
+
+# What the Job Object around *this* process allows a recovery guardian to do.
+GUARDIAN_CONTEXT_NONE = "no_enclosing_job"
+GUARDIAN_CONTEXT_ORDINARY = "ordinary_job"
+GUARDIAN_CONTEXT_HOSTILE = "kill_on_close_job"
+GUARDIAN_CONTEXT_UNREADABLE = "unreadable_job"
+
+
+class EnclosingJob(NamedTuple):
+    """The limits of the job this process runs in, and what they allow.
+
+    ``limit_flags`` is ``None`` whenever membership itself could not be
+    established, which is why the kind is a separate value: an unknown job is
+    not an ordinary one, and must never be treated as one.
+    """
+
+    kind: str
+    limit_flags: int | None
+
+    @property
+    def explicit_breakaway(self) -> bool:
+        """Whether the job grants ``JOB_OBJECT_LIMIT_BREAKAWAY_OK``.
+
+        This is the only limit that makes ``CREATE_BREAKAWAY_FROM_JOB`` legal -
+        the flag is rejected with ``ERROR_ACCESS_DENIED`` without it, so this
+        property, not "can a guardian leave", decides what is passed to
+        ``CreateProcess``.
+        """
+        return bool((self.limit_flags or 0) & _JOB_OBJECT_LIMIT_BREAKAWAY_OK)
+
+    @property
+    def silent_breakaway(self) -> bool:
+        """Whether the job grants ``JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK``.
+
+        Such a job already removes children from itself.  Adding
+        ``CREATE_BREAKAWAY_FROM_JOB`` on top does not make that more likely and
+        is not required - and where ``BREAKAWAY_OK`` is absent it makes the
+        launch fail outright.
+        """
+        return bool((self.limit_flags or 0) & _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)
+
+    @property
+    def can_escape(self) -> bool:
+        """Whether a child of this process can end up outside this job.
+
+        True outside any job (there is nothing to leave) and inside a job that
+        permits breakaway by either route.  Forbidding it is exactly the case
+        that makes a guardian a prisoner of its launcher.
+        """
+        return (
+            self.kind == GUARDIAN_CONTEXT_NONE
+            or self.explicit_breakaway
+            or self.silent_breakaway
+        )
+
+    @property
+    def permits_guardian(self) -> bool:
+        """Whether a guardian may run under this job context at all.
+
+        Only the confirmed kill-on-close job - and a job whose limits could not
+        be read - forbid it.  An ordinary job, or none at all, does not: being
+        in *some* job is an ordinary way to run a desktop application.
+        """
+        return self.kind in (GUARDIAN_CONTEXT_NONE, GUARDIAN_CONTEXT_ORDINARY)
+
+
+def _classify_job_flags(flags: int) -> str:
+    """The context a job with exactly these limit flags imposes on a guardian.
+
+    Only the combination "kill-on-close and no way out" is hostile: being in a
+    job at all, or even being killed with it, is survivable as long as the child
+    can be created outside that job.
+    """
+    if flags & _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE and not (
+        EnclosingJob(GUARDIAN_CONTEXT_ORDINARY, flags).can_escape
+    ):
+        # A launcher that closes this job takes every process in it with it,
+        # and this application cannot leave.  There is no guardian to start.
+        return GUARDIAN_CONTEXT_HOSTILE
+    return GUARDIAN_CONTEXT_ORDINARY
+
+
+def enclosing_job() -> EnclosingJob:
+    """Classify the Job Object this process itself runs in.
+
+    The limits of the enclosing job are readable without owning a job handle:
+    ``QueryInformationJobObject`` accepts ``NULL`` and then answers for the job
+    the *calling* process is associated with.  That is the only handle-free way
+    to tell a launcher-owned kill-on-close job from an ordinary one, so it is
+    what decides whether a guardian is allowed to exist here.
+    """
+    if os.name != "nt":
+        return EnclosingJob(GUARDIAN_CONTEXT_NONE, None)
+    try:
+        kernel32 = _job_kernel32()
+        handle = kernel32.GetCurrentProcess()
+        in_job = ctypes.c_int()
+        if not kernel32.IsProcessInJob(handle, None, ctypes.byref(in_job)):
+            logger.error(
+                "Enclosing job membership could not be established (error %s)",
+                ctypes.get_last_error(),
+            )
+            return EnclosingJob(GUARDIAN_CONTEXT_UNREADABLE, None)
+        if not in_job.value:
+            return EnclosingJob(GUARDIAN_CONTEXT_NONE, None)
+        info = _JobExtendedLimitInformation()
+        if not kernel32.QueryInformationJobObject(
+            None,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+            None,
+        ):
+            logger.error(
+                "Enclosing job limits could not be read (error %s)",
+                ctypes.get_last_error(),
+            )
+            return EnclosingJob(GUARDIAN_CONTEXT_UNREADABLE, None)
+        flags = int(info.BasicLimitInformation.LimitFlags)
+        return EnclosingJob(_classify_job_flags(flags), flags)
+    except (OSError, AttributeError):  # pragma: no cover - non-Windows/defensive
+        logger.exception("Enclosing job classification failed")
+        return EnclosingJob(GUARDIAN_CONTEXT_UNREADABLE, None)
 
 
 def job_active_processes(name: str) -> int | None:
@@ -1411,17 +1546,35 @@ def guardian_environment() -> dict[str, str] | None:
 
 # The capture helpers are bound to a kill-on-close Job Object so they cannot
 # outlive LookUp.  The recovery executor is the exact opposite case: it *must*
-# outlive the application.  Breaking away from any job the application itself
-# runs in keeps that promise even when LookUp is started from a shell, a service
-# or another application that puts its children into a job.
+# outlive the application, so it leaves the job LookUp runs in whenever that job
+# lets it - a shell, a service or another application may have put LookUp into a
+# job of its own.  Leaving is requested, never assumed, and never traded away to
+# make a launch succeed: whether the enclosing job tolerates it is read from its
+# limits by ``enclosing_job`` and decided before anything is started.  The two
+# breakaway limits are not interchangeable - see ``EnclosingJob.explicit_breakaway``
+# and ``EnclosingJob.silent_breakaway``.
 _CREATE_BREAKAWAY_FROM_JOB = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
-def _guardian_creation_flags() -> int:
+def _guardian_creation_flags(enclosing: EnclosingJob | None = None) -> int:
+    """Creation flags for one guardian launch.
+
+    ``CREATE_BREAKAWAY_FROM_JOB`` is requested exactly where it is both legal
+    and needed: inside a job that granted ``JOB_OBJECT_LIMIT_BREAKAWAY_OK``.
+    The two other cases must not carry it.
+
+    Outside any job the flag is inert, so it is not passed at all.  Inside a
+    job that only granted ``JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`` the children
+    are already detached, and the flag is not merely redundant there - without
+    ``BREAKAWAY_OK`` the launch fails with ``ERROR_ACCESS_DENIED``.  So the
+    silent mode is honoured by *not* asking for anything.
+    """
     if os.name != "nt":
         return 0
-    return _CREATE_NO_WINDOW | _CREATE_BREAKAWAY_FROM_JOB
+    if enclosing is not None and enclosing.explicit_breakaway:
+        return _CREATE_NO_WINDOW | _CREATE_BREAKAWAY_FROM_JOB
+    return _CREATE_NO_WINDOW
 
 
 def _spawn(
@@ -1432,19 +1585,34 @@ def _spawn(
 ) -> subprocess.Popen | None:
     """Start a guardian and return it only after independent readiness.
 
-    A guardian that remains in an enclosing Job Object is *not* an independent
-    recovery executor: the launcher that owns that job can terminate LookUp and
-    the guardian together.  The launch is therefore fail-closed at three points:
+    The decision is made once, from the enclosing job's own limits, before
+    anything is launched:
 
-    * breakaway denied -> no fallback launch inside the enclosing job;
-    * job independence cannot be proved -> reject the child;
-    * temporary launch-job adoption fails -> reject the child.
+    * confirmed kill-on-close job that forbids breakaway -> no guardian at all,
+      and therefore no park: that job's owner can kill LookUp and its executor
+      in one step, and there is no way out of it;
+    * enclosing job whose limits cannot be read -> fail closed the same way,
+      because "unknown" is not "harmless";
+    * ordinary job, or none -> the guardian is allowed, and the child leaves the
+      enclosing job by whichever breakaway mode that job actually granted.
 
-    Only a child proven free of inherited jobs is put in our short-lived
-    kill-on-close launch job and allowed to confirm readiness.
+    What a guardian's *own* ``IsProcessInJob`` answer cannot do is prove
+    danger: membership in some job is how a supervised desktop application
+    normally runs, and a breakaway child can still be reported inside an
+    unrelated one.  So membership is only rejected where nothing in the parent
+    could have put the child there.
     """
     env = guardian_environment()
-    creationflags = _guardian_creation_flags() if os.name == "nt" else 0
+    enclosing = enclosing_job()
+    if not enclosing.permits_guardian:
+        logger.error(
+            "Recovery guardian refused: this process runs in a %s (limits %s); "
+            "there is no way to start an executor that could outlive it",
+            enclosing.kind,
+            hex(enclosing.limit_flags) if enclosing.limit_flags is not None else "unreadable",
+        )
+        return None
+    creationflags = _guardian_creation_flags(enclosing) if os.name == "nt" else 0
     job = _GuardianLaunchJob()
     try:
         process = subprocess.Popen(
@@ -1468,10 +1636,20 @@ def _spawn(
         return None
 
     inherited_job = process_in_any_job(process)
-    if inherited_job is not False:
+    if inherited_job is None:
         logger.error(
-            "Recovery guardian pid=%s is not proven independent from an enclosing "
-            "Windows Job Object; refusing the handover",
+            "Recovery guardian pid=%s job membership could not be verified; "
+            "refusing the handover",
+            process.pid,
+        )
+        _stop_unready_guardian(process, job)
+        return None
+    if enclosing.kind == GUARDIAN_CONTEXT_NONE and inherited_job:
+        # Nothing in this process could have produced a job around the child,
+        # so this one was placed by somebody else and is not ours to judge.
+        logger.error(
+            "Recovery guardian pid=%s was placed into a Windows Job Object although "
+            "this process runs in none; refusing the handover",
             process.pid,
         )
         _stop_unready_guardian(process, job)

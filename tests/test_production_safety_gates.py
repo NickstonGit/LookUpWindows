@@ -997,8 +997,12 @@ class ReleaseContractTests(unittest.TestCase):
         )
         # ... and the capture helpers still must not survive.
         self.assertIn("capture helpers survived", scenario)
-        tail = smoke.split("def run_tail(", 1)[1].split("\ndef ", 1)[0]
-        self.assertIn("guardian to exit", tail)
+        self.assertIn("guardian to exit", smoke.split("def wait_for_executor_exit(", 1)[1])
+        self.assertIn(
+            "wait_for_executor_exit(args)",
+            smoke.split("def run_tail(", 1)[1].split("\ndef ", 1)[0],
+            "the tail of a passing scenario still has to wait the guardian out",
+        )
 
     def test_the_release_gate_runs_the_registry_itself(self):
         release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
